@@ -1,8 +1,8 @@
 # requirements.txt ─ runtime dependencies for the “Eye for Blind” Colab notebook
 # Target environment: Python 3.8.10, TensorFlow 2.10.0 (+nv22.11) on 4×RTX 5000 GPUs
-matplotlib                       # for visualisations & attention heat-maps
-Pillow                           # image I/O and basic processing
-tqdm                             # neat CLI progress bars
-nltk                             # BLEU-1‒4 metrics (nltk.translate.bleu_score)
+# matplotlib                       # for visualisations & attention heat-maps
+# Pillow                           # image I/O and basic processing
+# tqdm                             # neat CLI progress bars
+# nltk                             # BLEU-1‒4 metrics (nltk.translate.bleu_score)
 gTTS                             # Google-TTS for caption-to-speech demo
 gdown
