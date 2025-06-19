@@ -26,13 +26,13 @@ import tqdm
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 CONFIG = {
-    'subset_ratio' : 0.001,
+    'subset_ratio' : 1.0,
     'image_dir': '/home/flickr30k_images/flickr30k_images',
     'caption_file': '/home/flickr30k_images/flickr30k_images/results.csv',
     
     # GPU Utilization
-    'batch_size': 128,           # Fully utilize 48GB VRAM; reduce if OOM
-    'buffer_size': 1000,         # Larger shuffle buffer helps training stability
+    'batch_size': 256,           # Fully utilize 48GB VRAM; reduce if OOM
+    'buffer_size': 10000,        # Larger shuffle buffer helps training stability
     
     # Model Capacity
     'max_length': 30,            # Reasonable for captions
@@ -41,7 +41,7 @@ CONFIG = {
     
     # Training Behavior
     'seed': 42,
-    'epochs': 20,                # Slightly more for small dataset
+    'epochs': 2,                # Slightly more for small dataset
     'patience': 4,               # Early stopping tolerance
     'learning_rate': 3e-4,       # Lower for small datasets to reduce overfitting
     'grad_clip_value': 5.0,      # Prevent exploding gradients
@@ -140,77 +140,62 @@ class DataProcessor:
         return f"<start> {caption.strip()} <end>"
     
     def prepare_captions(self, subset_ratio=1.0):
-        """Process all captions and create vocabulary."""
+        """Process captions, build tokenizer & train/val/test splits."""
         if not self.captions_dict:
             self.load_captions()
-        
-        print("Preprocessing captions...")
+
+        # --- 1. clean & tag ----------------------------------------------------
         all_captions = []
         for caps in self.captions_dict.values():
             for c in caps:
                 p = self.preprocess_caption(c)
                 if p:
                     all_captions.append(p)
-        
-        print(f"Total captions: {len(all_captions)}")
-        word_counts = Counter(word for cap in all_captions for word in cap.split())
-        valid_words = {word for word, count in word_counts.items()
-                    if count >= self.config['vocab_min_count']}
 
-        def keep_caption(caption: str) -> bool:
-            words = caption.split()
-            return all(w in valid_words or w in ('<start>', '<end>') for w in words)
+        word_counts = Counter(w for cap in all_captions for w in cap.split())
+        valid_words = {w for w, cnt in word_counts.items()
+                    if cnt >= self.config['vocab_min_count']}
 
-        filtered_captions = [c for c in all_captions if keep_caption(c)]
-        print(f"Filtered captions: {len(filtered_captions)}")
+        def keep(c):
+            return all(w in valid_words or w in ('<start>', '<end>') for w in c.split())
 
-        # Determine max_length based on 95th percentile
-        lengths = [len(c.split()) for c in filtered_captions]
-        suggested_max_length = int(np.percentile(lengths, 95))
-        print(f"95th percentile caption length: {suggested_max_length}")
-        print(f"Max caption length in dataset: {max(lengths)}")
-        
-        # Update config max_length internally
-        self.config['max_length'] = suggested_max_length
-        print(f"Using max_length = {self.config['max_length']}")
+        filtered = [c for c in all_captions if keep(c)]
 
-        print("Building tokenizer...")
-        tokenizer = Tokenizer(oov_token="<unk>")
-        tokenizer.fit_on_texts(filtered_captions)
+        # --- 2. determine max length ------------------------------------------
+        lengths = [len(c.split()) for c in filtered]
+        self.config['max_length'] = int(np.percentile(lengths, 95))
+        print(f"max_length set to {self.config['max_length']}")
 
-        for token in ['<start>', '<end>']:
-            if token not in tokenizer.word_index:
-                new_index = len(tokenizer.word_index) + 1
-                tokenizer.word_index[token] = new_index
-                tokenizer.index_word[new_index] = token
-
+        # --- 3. build tokenizer (NO filters so < and > stay) -------------------
+        tokenizer = Tokenizer(oov_token="<unk>", filters='', lower=True)
+        tokenizer.fit_on_texts(filtered)
         self.tokenizer = tokenizer
         self.vocab_size = len(tokenizer.word_index) + 1
-        print(f"Vocabulary size: {self.vocab_size}")
+        print(f"vocab size = {self.vocab_size}")
 
-        image_caption_pairs = []
+        # --- 4. build (image, caption) list ------------------------------------
+        pairs = []
         for img, caps in self.captions_dict.items():
             for c in caps:
                 p = self.preprocess_caption(c)
-                if p and keep_caption(p):
-                    image_caption_pairs.append((img, p))
+                if p and keep(p):
+                    pairs.append((img, p))
 
         if subset_ratio < 1.0:
-            original_len = len(image_caption_pairs)
-            image_caption_pairs = image_caption_pairs[:int(original_len * subset_ratio)]
-            print(f"Using subset of {len(image_caption_pairs)} out of {original_len} total pairs")
+            pairs = pairs[:int(len(pairs) * subset_ratio)]
+            print(f"subset: {len(pairs)} pairs")
 
-        random.shuffle(image_caption_pairs)
+        random.shuffle(pairs)
+        n = len(pairs)
+        self.train_data, self.val_data, self.test_data = (
+            pairs[:int(0.8*n)],
+            pairs[int(0.8*n):int(0.9*n)],
+            pairs[int(0.9*n):],
+        )
+        print(f"split  →  train {len(self.train_data)} | val {len(self.val_data)} | test {len(self.test_data)}")
 
-        num_total = len(image_caption_pairs)
-        train_split = int(0.8 * num_total)
-        val_split = int(0.9 * num_total)
-        self.train_data = image_caption_pairs[:train_split]
-        self.val_data = image_caption_pairs[train_split:val_split]
-        self.test_data = image_caption_pairs[val_split:]
+        return filtered
 
-        print(f"Dataset split: Train={len(self.train_data)}, Val={len(self.val_data)}, Test={len(self.test_data)}")
-        return filtered_captions
         
     def encode_caption(self, caption: str) -> Tuple[np.ndarray, int]:
         """Convert caption text to sequence of token ids."""
