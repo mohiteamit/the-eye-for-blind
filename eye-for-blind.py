@@ -1,5 +1,5 @@
 # The Eye For Blind - Image Captioning System
-# Optimized for multi-GPU environment (4xRTX5000)
+# Optimized for single GPU environment (RTX 6000 Ada)
 
 import os
 import re
@@ -22,12 +22,12 @@ from gtts import gTTS #type: ignore
 from IPython.display import Audio, display
 import tqdm
 
-# Configuration
+# Configuration - Optimized for RTX 6000 Ada
 CONFIG = {
     'image_dir': 'data/flickr30k_images',
     'caption_file': 'data/flickr30k_images/results.csv',
-    'batch_size': 128,  # Increased for better GPU utilization
-    'buffer_size': 8192,  # Larger shuffle buffer
+    'batch_size': 64,  # Reduced from 128 for single GPU
+    'buffer_size': 31783,
     'max_length': 30,
     'embedding_dim': 512,
     'units': 512,
@@ -38,7 +38,7 @@ CONFIG = {
     'grad_clip_value': 5.0,
     'vocab_min_count': 5,
     'checkpoint_dir': './checkpoints',
-    'mixed_precision': True,  # Enable mixed precision for faster training
+    'mixed_precision': True,  # Keep enabled for RTX 6000 Ada
 }
 
 # Set random seeds for reproducibility
@@ -46,30 +46,22 @@ tf.random.set_seed(CONFIG['seed'])
 np.random.seed(CONFIG['seed'])
 random.seed(CONFIG['seed'])
 
-# Enable mixed precision for faster training
+# Mixed precision policy - RTX 6000 Ada has excellent mixed precision support
 if CONFIG['mixed_precision']:
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.set_global_policy(policy)
-    print("Mixed precision enabled")
+    print("Mixed precision enabled for RTX 6000 Ada")
 
-# Configure GPUs for optimal performance
+# Single GPU setup
 physical_devices = tf.config.list_physical_devices('GPU')
-if len(physical_devices) > 0:
-    print(f"Found {len(physical_devices)} GPUs")
+if physical_devices:
+    # Enable memory growth for RTX 6000 Ada
     for gpu in physical_devices:
-        try:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(f"Error setting memory growth: {e}")
+        tf.config.experimental.set_memory_growth(gpu, True)
     
-    # Enable multi-GPU training if available
-    if len(physical_devices) > 1:
-        strategy = tf.distribute.MirroredStrategy()
-        print(f"Using strategy: {strategy}")
-        CONFIG['batch_size'] *= len(physical_devices)  # Scale batch size with number of GPUs
-        print(f"Adjusted batch size to {CONFIG['batch_size']}")
-    else:
-        strategy = tf.distribute.get_strategy()
+    # Use default strategy for single GPU
+    strategy = tf.distribute.get_strategy()
+    print(f"Using single GPU: {physical_devices[0].name}, batch size={CONFIG['batch_size']}")
 else:
     print("No GPUs found, using CPU")
     strategy = tf.distribute.get_strategy()
@@ -204,16 +196,16 @@ class DataProcessor:
         padded_seq = pad_sequences([seq], maxlen=self.config['max_length'], padding='post')[0]
         return padded_seq, len(seq)
     
-    @tf.function
+    @tf.function(reduce_retracing=True)
     def load_image(self, path: str) -> tf.Tensor:
-        """Load and preprocess an image with caching for efficiency."""
+        """Load and preprocess an image efficiently in graph mode."""
         img = tf.io.read_file(path)
         img = tf.image.decode_jpeg(img, channels=3)
         img = tf.image.convert_image_dtype(img, dtype=tf.float32)
-        img = tf.image.resize_with_pad(img, 299, 299)
-        img = tf.keras.applications.inception_v3.preprocess_input(img)
-        return img
-    
+        img = tf.image.resize(img, [299, 299])
+        img = tf.ensure_shape(img, [299, 299, 3])
+        return tf.keras.applications.inception_v3.preprocess_input(img)
+
     def data_generator(self, data):
         """Generator function for dataset creation."""
         for img, cap in data:
@@ -223,32 +215,30 @@ class DataProcessor:
             yield img_tensor, token_ids, cap_len
     
     def build_dataset(self, data, shuffle=True, cache=True):
-        """Build efficient TensorFlow dataset with caching and prefetching."""
+        """Create a tf.data.Dataset optimized for single GPU."""
         output_signature = (
-            tf.TensorSpec(shape=(299, 299, 3), dtype=tf.float32),
-            tf.TensorSpec(shape=(self.config['max_length'],), dtype=tf.int32),
-            tf.TensorSpec(shape=(), dtype=tf.int32)
+            tf.TensorSpec((299, 299, 3), tf.float32),
+            tf.TensorSpec((CONFIG['max_length'],), tf.int32),
+            tf.TensorSpec((), tf.int32)
         )
-        
+
         ds = tf.data.Dataset.from_generator(
-            lambda: self.data_generator(data), 
+            lambda: self.data_generator(data),
             output_signature=output_signature
         )
-        
+
         if cache:
             ds = ds.cache()
-        
         if shuffle:
-            ds = ds.shuffle(self.config['buffer_size'])
-        
-        ds = ds.padded_batch(self.config['batch_size'])
+            ds = ds.shuffle(CONFIG['buffer_size'])
+
+        ds = ds.batch(CONFIG['batch_size'])
         ds = ds.prefetch(AUTOTUNE)
-        
         return ds
-    
+
     def prepare_datasets(self, small_subset=False):
         """Prepare all datasets for training/validation/testing."""
-        if self.train_data is None:
+        if not self.train_data:
             self.prepare_captions()
         
         if small_subset:
@@ -313,7 +303,7 @@ class Decoder(Model):
         self.lstm = layers.LSTM(units, return_sequences=True, return_state=True)
         self.fc = layers.Dense(vocab_size)
         self.attention = BahdanauAttention(units)
-        self.dropout = layers.Dropout(0.3)  # Add dropout for regularization
+        self.dropout = layers.Dropout(0.3)
     
     def call(self, x, features, hidden, cell):
         context, attn = self.attention(features, hidden)
@@ -326,21 +316,7 @@ class Decoder(Model):
 
 
 class ImageCaptioningModel:
-    """
-    ImageCaptioningModel: A class for generating captions from images using an encoder-decoder architecture.
-    This model uses a CNN encoder to extract image features and an RNN decoder with attention
-    to generate textual descriptions. It includes functionality for training, evaluation,
-    inference with visualization of attention weights, and text-to-speech conversion.
-    """
     def __init__(self, config, processor):
-        """
-        Initialize the image captioning model.
-        Args:
-            config (dict): Configuration parameters for the model including learning rates,
-                          dimensions, checkpoint directories, etc.
-            processor (object): Data processor that handles image loading, tokenization,
-                               and vocabulary management.
-        """
         self.config = config
         self.processor = processor
         self.encoder = None
@@ -354,26 +330,21 @@ class ImageCaptioningModel:
         self.smoothie = SmoothingFunction().method4
     
     def build_model(self):
-        """
-        Initialize model components including encoder, decoder, optimizer, and checkpoint system.
-        Sets up the CNN encoder, RNN decoder with attention, Adam optimizer with cosine decay,
-        and checkpoint management for model persistence.
-        """
-        print("Building model...")
-        with strategy.scope():
-            self.encoder = Encoder()
-            self.decoder = Decoder(
-                embedding_dim=self.config['embedding_dim'], 
-                units=self.config['units'], 
-                vocab_size=self.processor.vocab_size
-            )
-            
-            lr_schedule = CosineDecay(
-                initial_learning_rate=self.config['learning_rate'],
-                decay_steps=10000
-            )
-            self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-            self.loss_fn = SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+        """Build model for single GPU - no distribution strategy needed."""
+        print("Building model for single GPU...")
+        self.encoder = Encoder()
+        self.decoder = Decoder(
+            embedding_dim=self.config['embedding_dim'], 
+            units=self.config['units'], 
+            vocab_size=self.processor.vocab_size
+        )
+        
+        lr_schedule = CosineDecay(
+            initial_learning_rate=self.config['learning_rate'],
+            decay_steps=10000
+        )
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+        self.loss_fn = SparseCategoricalCrossentropy(from_logits=True, reduction='none')
         
         # Set up checkpointing
         ckpt_dir = self.config['checkpoint_dir']
@@ -392,15 +363,7 @@ class ImageCaptioningModel:
     
     @tf.function
     def train_step(self, img_tensor, target, cap_len):
-        """
-        Execute a single training step with gradient calculation and optimization.
-        Args:
-            img_tensor (Tensor): Batch of processed images
-            target (Tensor): Target caption sequences
-            cap_len (Tensor): Length of each caption in the batch
-        Returns:
-            float: Average loss for this training step
-        """
+        """Execute a single training step."""
         loss = 0.0
         batch_size = tf.shape(img_tensor)[0]
         hidden = tf.zeros((batch_size, self.config['units']))
@@ -432,15 +395,7 @@ class ImageCaptioningModel:
         return total_loss
     
     def greedy_decode(self, image_path: str, return_attention=False):
-        """
-        Generate a caption for an image using greedy decoding strategy.
-        Args:
-            image_path (str): Path to the image file
-            return_attention (bool): Whether to return attention weights
-        Returns:
-            list or tuple: List of words if return_attention is False,
-                          tuple of (words, attention_weights) if True
-        """
+        """Generate a caption for an image using greedy decoding."""
         img_tensor = tf.expand_dims(self.processor.load_image(image_path), 0)
         features = self.encoder(img_tensor)
         hidden = tf.zeros((1, self.config['units']))
@@ -466,18 +421,11 @@ class ImageCaptioningModel:
         return (result, alphas) if return_attention else result
     
     def evaluate_bleu(self, test_data, max_samples=None):
-        """
-        Calculate BLEU scores on test data to evaluate model performance.
-        Args:
-            test_data (list): List of (image_name, captions) pairs for evaluation
-            max_samples (int, optional): Maximum number of samples to evaluate
-        Returns:
-            dict: Dictionary containing BLEU scores for different n-gram sizes
-        """
+        """Calculate BLEU scores on test data."""
         refs, hyps = [], []
         data_to_eval = test_data[:max_samples] if max_samples else test_data
         
-        for img_name, caps in tqdm.tqdm(data_to_eval):
+        for img_name, _ in tqdm.tqdm(data_to_eval):
             image_path = os.path.join(self.config['image_dir'], img_name)
             hyp = self.greedy_decode(image_path)
             
@@ -499,15 +447,7 @@ class ImageCaptioningModel:
         return bleu_scores
     
     def train(self, train_ds, val_data, epochs=None):
-        """
-        Train the model with early stopping based on validation BLEU score.
-        Args:
-            train_ds (tf.data.Dataset): Training dataset
-            val_data (list): Validation data for BLEU score calculation
-            epochs (int, optional): Number of epochs to train for, defaults to config value
-        Returns:
-            tuple: Training loss history and validation BLEU score history
-        """
+        """Train the model with early stopping."""
         if epochs is None:
             epochs = self.config['epochs']
         
@@ -522,13 +462,12 @@ class ImageCaptioningModel:
             # Training loop
             print(f"Epoch {epoch+1}/{epochs}")
             progbar = tf.keras.utils.Progbar(
-                target=None,  # Will be updated after first batch
+                target=None,
                 stateful_metrics=['loss']
             )
             
             for batch, (img_tensor, target, cap_len) in enumerate(train_ds):
                 if batch == 0 and progbar.target is None:
-                    # Estimate total steps
                     progbar.target = len(self.processor.train_data) // self.config['batch_size'] + 1
                 
                 batch_loss = self.train_step(img_tensor, target, cap_len)
@@ -545,7 +484,7 @@ class ImageCaptioningModel:
             
             # Validation on a subset for speed
             print("Evaluating on validation subset...")
-            validation_subset = val_data[:100]  # Evaluate on subset for speed
+            validation_subset = val_data[:100]
             bleu_scores = self.evaluate_bleu(validation_subset)
             bleu4 = bleu_scores['bleu-4']
             self.val_bleu_log.append(bleu4)
@@ -560,18 +499,12 @@ class ImageCaptioningModel:
                     print(f"Early stopping triggered at epoch {epoch+1}")
                     break
             
-            print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}, BLEU-4 = {bleu4:.4f}, Time = {time.time()-start:.2f}s")
+            print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}, BLEU-4 = {bleu4:.4f}, Time = {time.time()-start:.2f}s", flush=True)
         
         return self.train_loss_log, self.val_bleu_log
     
     def plot_attention(self, image_path: str, caption: list, alphas: list):
-        """
-        Visualize attention weights overlaid on the source image.
-        Args:
-            image_path (str): Path to the image file
-            caption (list): List of words in the generated caption
-            alphas (list): List of attention weight matrices
-        """
+        """Visualize attention weights overlaid on the source image."""
         img = np.array(Image.open(image_path).resize((224, 224)))
         fig = plt.figure(figsize=(15, 8))
         
@@ -590,11 +523,7 @@ class ImageCaptioningModel:
         plt.show()
     
     def plot_history(self):
-        """
-        Plot training history including loss and BLEU scores over epochs.
-        Generates a figure with two subplots showing the training loss curve
-        and validation BLEU-4 score progression.
-        """
+        """Plot training history."""
         plt.figure(figsize=(12, 5))
         
         plt.subplot(1, 2, 1)
@@ -617,9 +546,72 @@ class ImageCaptioningModel:
         plt.show()
     
     def speak_caption(self, caption: str, filename="tts_output.mp3"):
-        """
-        Generate speech audio from the caption text using gTTS.
-        Args:
+        """Generate speech audio from caption text."""
+        if not caption:
+            print("Empty caption, nothing to speak")
+            return
+            
+        tts = gTTS(text=caption, lang='en')
+        tts.save(filename)
+        display(Audio(filename))
+        print(f"Audio saved to {filename}")
+    
+    def demo(self, image_path):
+        """Run a full demonstration of the model."""
+        if not os.path.exists(image_path):
+            print(f"Image not found: {image_path}")
+            return
+            
+        print(f"Generating caption for: {image_path}")
+        
+        # Display the image
+        img = Image.open(image_path)
+        plt.figure(figsize=(8, 6))
+        plt.imshow(img)
+        plt.axis('off')
+        plt.show()
+        
+        # Generate caption with attention
+        words, attention = self.greedy_decode(image_path, return_attention=True)
+        caption = " ".join(words)
+        print(f"Generated caption: {caption}")
+        
+        # Plot attention
+        self.plot_attention(image_path, words, attention)
+        
+        # Generate speech
+        self.speak_caption(caption)
+        
+        return caption
+
+
+def main():
+    # Initialize processor and load data
+    processor = DataProcessor(CONFIG)
+    processor.load_captions()
+    processor.display_samples(2)
+    processor.prepare_captions()
+    
+    # Create datasets
+    train_ds, val_ds, test_ds = processor.prepare_datasets()
+    
+    # Build and train model
+    model = ImageCaptioningModel(CONFIG, processor)
+    model.build_model()
+    
+    # Train the model
+    model.train(train_ds, processor.val_data)
+    model.plot_history()
+    
+    # Evaluate on test set
+    print("Evaluating on test set:")
+    model.evaluate_bleu(processor.test_data[:20])
+    
+    # Demo with a sample image
+    sample_img = os.path.join(CONFIG['image_dir'], processor.test_data[0][0])
+    model.demo(sample_img)
+
+
             caption (str): Text to convert to speech
             filename (str): Output audio file path
         """
@@ -666,9 +658,6 @@ class ImageCaptioningModel:
         # Generate speech
         self.speak_caption(caption)
         
-        return caption
-
-# Main execution
 def main():
     # Initialize processor and load data
     processor = DataProcessor(CONFIG)
@@ -677,20 +666,23 @@ def main():
     processor.prepare_captions()
     
     # Create datasets
-    train_ds, val_ds, _ = processor.prepare_datasets()
+    train_ds, val_ds, test_ds = processor.prepare_datasets()
     
     # Build and train model
     model = ImageCaptioningModel(CONFIG, processor)
     model.build_model()
     
     # Uncomment to train the model
-    # model.train(train_ds, processor.val_data)
-    # model.plot_history()
+    model.train(train_ds, processor.val_data)
+    model.plot_history()
     
     # Evaluate on test set
     print("Evaluating on test set:")
     model.evaluate_bleu(processor.test_data[:20])
     
+    # Demo with a sample image
+    sample_img = os.path.join(CONFIG['image_dir'], processor.test_data[0][0])
+    model.demo(sample_img)
     # Demo with a sample image
     sample_img = os.path.join(CONFIG['image_dir'], processor.test_data[0][0])
     model.demo(sample_img)
