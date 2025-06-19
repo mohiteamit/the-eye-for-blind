@@ -439,29 +439,38 @@ class ImageCaptioningModel:
     
     def greedy_decode(self, image_path: str, return_attention=False):
         """Generate a caption for an image using greedy decoding."""
-        img_tensor = tf.expand_dims(self.processor.load_image(image_path), 0)
+        # Convert Python string -> tf.Tensor to match load_image() signature
+        img_tensor = tf.expand_dims(
+            self.processor.load_image(tf.convert_to_tensor(image_path)),
+            0
+        )
+
         features = self.encoder(img_tensor)
-        hidden = tf.zeros((1, self.config['units']))
-        cell = tf.zeros_like(hidden)
-        dec_input = tf.expand_dims([self.processor.tokenizer.word_index['<start>']], 0)
-        
+        hidden  = tf.zeros((1, self.config['units']))
+        cell    = tf.zeros_like(hidden)
+        dec_input = tf.expand_dims(
+            [self.processor.tokenizer.word_index['<start>']], 0
+        )
+
         result, alphas = [], []
-        
+
         for _ in range(self.config['max_length']):
-            logits, hidden, cell, alpha = self.decoder(dec_input, features, hidden, cell)
-            predicted_id = tf.argmax(logits[0, 0]).numpy()
-            
-            word = self.processor.tokenizer.index_word.get(predicted_id, '')
-            if word == '<end>': 
+            logits, hidden, cell, alpha = self.decoder(
+                dec_input, features, hidden, cell
+            )
+            pred_id = tf.argmax(logits[0, 0]).numpy()
+            word = self.processor.tokenizer.index_word.get(pred_id, '')
+
+            if word == '<end>':
                 break
-                
             if word not in ('<start>', '<unk>'):
                 result.append(word)
-                
+
             alphas.append(alpha[0].numpy())
-            dec_input = tf.expand_dims([predicted_id], 0)
-        
+            dec_input = tf.expand_dims([pred_id], 0)
+
         return (result, alphas) if return_attention else result
+
     
     def evaluate_bleu(self, test_data, max_samples=None):
         """Calculate BLEU scores on test data."""
