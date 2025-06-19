@@ -1,6 +1,7 @@
-# The Eye For Blind - Image Captioning System
-# Optimized for single GPU environment (RTX 6000 Ada)
+"""
+Here my current code. Consume I will give you specific instructions or questions based on code. Always respond to question with only required information, no additional information needed unless asked. When a function updates, always provide complete updated code.
 
+"""
 import os
 import re
 import time
@@ -10,7 +11,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from collections import Counter
 from PIL import Image
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional
 import tensorflow as tf #type: ignore
 from tensorflow.keras import layers, Model #type: ignore
 from tensorflow.keras.optimizers.schedules import CosineDecay #type: ignore
@@ -22,23 +23,35 @@ from gtts import gTTS #type: ignore
 from IPython.display import Audio, display
 import tqdm
 
-# Configuration - Optimized for RTX 6000 Ada
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 CONFIG = {
-    'image_dir': 'data/flickr30k_images',
-    'caption_file': 'data/flickr30k_images/results.csv',
-    'batch_size': 64,  # Reduced from 128 for single GPU
-    'buffer_size': 31783,
-    'max_length': 30,
-    'embedding_dim': 512,
-    'units': 512,
+    'subset_ratio' : 0.001,
+    'image_dir': '/home/flickr30k_images/flickr30k_images',
+    'caption_file': '/home/flickr30k_images/flickr30k_images/results.csv',
+    
+    # GPU Utilization
+    'batch_size': 128,           # Fully utilize 48GB VRAM; reduce if OOM
+    'buffer_size': 1000,         # Larger shuffle buffer helps training stability
+    
+    # Model Capacity
+    'max_length': 30,            # Reasonable for captions
+    'embedding_dim': 512,        # Good for attention + LSTM
+    'units': 512,                # LSTM/Attention size
+    
+    # Training Behavior
     'seed': 42,
-    'epochs': 15,
-    'patience': 4,
-    'learning_rate': 1e-3,
-    'grad_clip_value': 5.0,
-    'vocab_min_count': 5,
-    'checkpoint_dir': './checkpoints',
-    'mixed_precision': True,  # Keep enabled for RTX 6000 Ada
+    'epochs': 20,                # Slightly more for small dataset
+    'patience': 4,               # Early stopping tolerance
+    'learning_rate': 3e-4,       # Lower for small datasets to reduce overfitting
+    'grad_clip_value': 5.0,      # Prevent exploding gradients
+    
+    # Vocabulary
+    'vocab_min_count': 3,        # Include more words for small run
+    
+    # Output & Precision
+    'checkpoint_dir': './checkpoints/10pct',
+    'mixed_precision': False,     # RTX 6000 Ada has 4th-gen Tensor Cores—use them
 }
 
 # Set random seeds for reproducibility
@@ -69,7 +82,6 @@ else:
 # Constants
 AUTOTUNE = tf.data.AUTOTUNE
 
-
 class DataProcessor:
     def __init__(self, config):
         self.config = config
@@ -97,22 +109,27 @@ class DataProcessor:
         return caption_map
     
     def display_samples(self, num_samples: int = 3):
-        """Display sample images with their captions."""
-        if self.captions_dict is None:
+        """Display random images with all their associated captions."""
+        if not self.captions_dict:
             self.load_captions()
-        
-        sample_keys = random.sample(list(self.captions_dict.keys()), num_samples)
+
+        sample_keys = random.sample(list(self.captions_dict.keys()), min(num_samples, len(self.captions_dict)))
+
         for key in sample_keys:
             img_path = os.path.join(self.config['image_dir'], key)
-            img = Image.open(img_path)
-            plt.figure(figsize=(8, 6))
-            plt.imshow(img)
-            plt.axis('off')
-            plt.title(key)
-            plt.show()
-            for cap in self.captions_dict[key][:5]: #type: ignore
-                print(f"- {cap}")
-            print()
+            try:
+                img = Image.open(img_path)
+                plt.figure(figsize=(8, 6))
+                plt.imshow(img)
+                plt.axis('off')
+                plt.title(key)
+                plt.show()
+
+                for cap in self.captions_dict[key]:
+                    print(f"- {cap}")
+                print()
+            except Exception as e:
+                print(f"Error loading image {key}: {e}")
     
     def preprocess_caption(self, caption: str) -> Optional[str]:
         """Clean and format caption text."""
@@ -122,13 +139,12 @@ class DataProcessor:
         caption = re.sub(r"[^a-z0-9.,? ]", "", caption)
         return f"<start> {caption.strip()} <end>"
     
-    def prepare_captions(self):
+    def prepare_captions(self, subset_ratio=1.0):
         """Process all captions and create vocabulary."""
-        if self.captions_dict is None:
+        if not self.captions_dict:
             self.load_captions()
         
         print("Preprocessing captions...")
-        # Prepare captions and vocabulary
         all_captions = []
         for caps in self.captions_dict.values():
             for c in caps:
@@ -138,55 +154,64 @@ class DataProcessor:
         
         print(f"Total captions: {len(all_captions)}")
         word_counts = Counter(word for cap in all_captions for word in cap.split())
-        valid_words = {word for word, count in word_counts.items() 
-                      if count >= self.config['vocab_min_count']}
-        
-        # Filter captions by valid words
+        valid_words = {word for word, count in word_counts.items()
+                    if count >= self.config['vocab_min_count']}
+
         def keep_caption(caption: str) -> bool:
             words = caption.split()
             return all(w in valid_words or w in ('<start>', '<end>') for w in words)
-        
+
         filtered_captions = [c for c in all_captions if keep_caption(c)]
         print(f"Filtered captions: {len(filtered_captions)}")
+
+        # Determine max_length based on 95th percentile
+        lengths = [len(c.split()) for c in filtered_captions]
+        suggested_max_length = int(np.percentile(lengths, 95))
+        print(f"95th percentile caption length: {suggested_max_length}")
+        print(f"Max caption length in dataset: {max(lengths)}")
         
-        # Create tokenizer
+        # Update config max_length internally
+        self.config['max_length'] = suggested_max_length
+        print(f"Using max_length = {self.config['max_length']}")
+
         print("Building tokenizer...")
         tokenizer = Tokenizer(oov_token="<unk>")
         tokenizer.fit_on_texts(filtered_captions)
-        
-        # Ensure special tokens are in the vocabulary
-        special_tokens = ['<start>', '<end>']
-        for token in special_tokens:
+
+        for token in ['<start>', '<end>']:
             if token not in tokenizer.word_index:
                 new_index = len(tokenizer.word_index) + 1
                 tokenizer.word_index[token] = new_index
                 tokenizer.index_word[new_index] = token
-        
+
         self.tokenizer = tokenizer
         self.vocab_size = len(tokenizer.word_index) + 1
         print(f"Vocabulary size: {self.vocab_size}")
-        
-        # Create image-caption pairs
-        print("Creating image-caption pairs...")
+
         image_caption_pairs = []
         for img, caps in self.captions_dict.items():
             for c in caps:
                 p = self.preprocess_caption(c)
                 if p and keep_caption(p):
                     image_caption_pairs.append((img, p))
-        
-        # Create train/val/test splits
+
+        if subset_ratio < 1.0:
+            original_len = len(image_caption_pairs)
+            image_caption_pairs = image_caption_pairs[:int(original_len * subset_ratio)]
+            print(f"Using subset of {len(image_caption_pairs)} out of {original_len} total pairs")
+
         random.shuffle(image_caption_pairs)
+
         num_total = len(image_caption_pairs)
         train_split = int(0.8 * num_total)
         val_split = int(0.9 * num_total)
         self.train_data = image_caption_pairs[:train_split]
         self.val_data = image_caption_pairs[train_split:val_split]
         self.test_data = image_caption_pairs[val_split:]
-        
+
         print(f"Dataset split: Train={len(self.train_data)}, Val={len(self.val_data)}, Test={len(self.test_data)}")
         return filtered_captions
-    
+        
     def encode_caption(self, caption: str) -> Tuple[np.ndarray, int]:
         """Convert caption text to sequence of token ids."""
         if self.tokenizer is None:
@@ -196,7 +221,7 @@ class DataProcessor:
         padded_seq = pad_sequences([seq], maxlen=self.config['max_length'], padding='post')[0]
         return padded_seq, len(seq)
     
-    @tf.function(reduce_retracing=True)
+    @tf.function(input_signature=[tf.TensorSpec([], tf.string)])
     def load_image(self, path: str) -> tf.Tensor:
         """Load and preprocess an image efficiently in graph mode."""
         img = tf.io.read_file(path)
@@ -210,7 +235,7 @@ class DataProcessor:
         """Generator function for dataset creation."""
         for img, cap in data:
             img_path = os.path.join(self.config['image_dir'], img)
-            img_tensor = self.load_image(img_path)
+            img_tensor = self.load_image(tf.convert_to_tensor(img_path))
             token_ids, cap_len = self.encode_caption(cap)
             yield img_tensor, token_ids, cap_len
     
@@ -218,7 +243,7 @@ class DataProcessor:
         """Create a tf.data.Dataset optimized for single GPU."""
         output_signature = (
             tf.TensorSpec((299, 299, 3), tf.float32),
-            tf.TensorSpec((CONFIG['max_length'],), tf.int32),
+            tf.TensorSpec((self.config['max_length'],), tf.int32),
             tf.TensorSpec((), tf.int32)
         )
 
@@ -230,35 +255,23 @@ class DataProcessor:
         if cache:
             ds = ds.cache()
         if shuffle:
-            ds = ds.shuffle(CONFIG['buffer_size'])
+            ds = ds.shuffle(self.config['buffer_size'])
 
-        ds = ds.batch(CONFIG['batch_size'])
+        ds = ds.batch(self.config['batch_size'])
         ds = ds.prefetch(AUTOTUNE)
         return ds
 
-    def prepare_datasets(self, small_subset=False):
+    def prepare_datasets(self):
         """Prepare all datasets for training/validation/testing."""
         if not self.train_data:
             self.prepare_captions()
-        
-        if small_subset:
-            # Use 10% of each dataset
-            train_subset = self.train_data[:int(len(self.train_data) * 0.1)]
-            val_subset = self.val_data[:int(len(self.val_data) * 0.1)]
-            test_subset = self.test_data[:int(len(self.test_data) * 0.1)]
-            print(f"Using small subset: Train={len(train_subset)}, Val={len(val_subset)}, Test={len(test_subset)}")
-        else:
-            train_subset = self.train_data
-            val_subset = self.val_data
-            test_subset = self.test_data
-        
+
         print("Building datasets...")
-        train_ds = self.build_dataset(train_subset)
-        val_ds = self.build_dataset(val_subset)
-        test_ds = self.build_dataset(test_subset, shuffle=False)
+        train_ds = self.build_dataset(self.train_data)
+        val_ds = self.build_dataset(self.val_data)
+        test_ds = self.build_dataset(self.test_data, shuffle=False)
         
         return train_ds, val_ds, test_ds
-
 
 class Encoder(Model):
     def __init__(self):
@@ -294,7 +307,6 @@ class BahdanauAttention(layers.Layer):
         context_vector = tf.reduce_sum(attention_weights * features, axis=1)
         return context_vector, tf.squeeze(attention_weights, -1)
 
-
 class Decoder(Model):
     def __init__(self, embedding_dim, units, vocab_size):
         super().__init__(name="decoder")
@@ -309,11 +321,14 @@ class Decoder(Model):
         context, attn = self.attention(features, hidden)
         x = self.embedding(x)
         x = tf.concat([tf.expand_dims(context, 1), x], axis=-1)
+        
+        hidden = tf.cast(hidden, x.dtype)
+        cell = tf.cast(cell, x.dtype)
+
         output, state_h, state_c = self.lstm(x, initial_state=[hidden, cell])
         output = self.dropout(output)
         logits = self.fc(output)
         return logits, state_h, state_c, attn
-
 
 class ImageCaptioningModel:
     def __init__(self, config, processor):
@@ -361,9 +376,44 @@ class ImageCaptioningModel:
             ckpt.restore(self.ckpt_manager.latest_checkpoint)
             print(f"Restored from checkpoint: {self.ckpt_manager.latest_checkpoint}")
     
+    def summary(self):
+        """Print model summaries for Encoder, Attention, and Decoder."""
+        print("Building model summaries...")
+
+        # Dummy inputs
+        dummy_image = tf.random.uniform((1, 299, 299, 3))
+        dummy_features = tf.random.uniform((1, 64, 2048))
+        dummy_hidden = tf.zeros((1, self.config['units']))
+        dummy_cell = tf.zeros((1, self.config['units']))
+        dummy_token = tf.zeros((1, 1), dtype=tf.int32)
+
+        # --- Encoder Summary ---
+        print("\nEncoder Summary:")
+        self.encoder(dummy_image)
+        self.encoder.summary()
+
+        # --- Bahdanau Attention Summary ---
+        print("\nBahdanau Attention Summary:")
+        attention_layer = BahdanauAttention(self.config['units'])
+        features_input = tf.keras.Input(shape=(64, 2048), name="features")
+        hidden_input = tf.keras.Input(shape=(self.config['units'],), name="hidden")
+        context_vector, attn_weights = attention_layer(features_input, hidden_input)
+        attention_model = tf.keras.Model(inputs=[features_input, hidden_input], outputs=[context_vector, attn_weights])
+        attention_model.summary()
+
+        # --- Decoder Summary ---
+        print("\nDecoder Summary:")
+        self.decoder(dummy_token, dummy_features, dummy_hidden, dummy_cell)
+        self.decoder.summary()
+
+
     @tf.function
     def train_step(self, img_tensor, target, cap_len):
         """Execute a single training step."""
+        # Ensure models are built
+        if self.encoder is None or self.decoder is None:
+            raise ValueError("Models not built. Call build_model() first.")
+        
         loss = 0.0
         batch_size = tf.shape(img_tensor)[0]
         hidden = tf.zeros((batch_size, self.config['units']))
@@ -378,15 +428,23 @@ class ImageCaptioningModel:
                 logits, hidden, cell, _ = self.decoder(dec_input, features, hidden, cell)
                 loss_ = self.loss_fn(target[:, t], tf.squeeze(logits, 1))
                 mask = tf.cast(target[:, t] > 0, tf.float32)
-                loss += tf.reduce_sum(loss_ * mask)
+                loss += tf.reduce_sum(tf.cast(loss_, tf.float32) * mask)
                 dec_input = tf.expand_dims(target[:, t], 1)
             
             # Average loss per token
             total_loss = loss / tf.reduce_sum(tf.cast(cap_len, tf.float32))
+            
+            # Handle mixed precision - scale loss for gradient computation
+            if CONFIG['mixed_precision']:
+                total_loss = tf.cast(total_loss, tf.float32)
         
         # Get trainable variables and apply gradients
         variables = self.encoder.trainable_variables + self.decoder.trainable_variables
         gradients = tape.gradient(total_loss, variables)
+        
+        # Handle mixed precision - cast gradients to float32 if needed
+        if self.config['mixed_precision']:
+            gradients = [tf.cast(g, tf.float32) if g is not None else None for g in gradients]
         
         # Clip gradients to prevent exploding gradients
         clipped_gradients, _ = tf.clip_by_global_norm(gradients, self.config['grad_clip_value'])
@@ -545,7 +603,7 @@ class ImageCaptioningModel:
         plt.tight_layout()
         plt.show()
     
-    def speak_caption(self, caption: str, filename="tts_output.mp3"):
+    def speak_caption(self, caption: str, filename="caption_audio.mp3"):
         """Generate speech audio from caption text."""
         if not caption:
             print("Empty caption, nothing to speak")
@@ -556,7 +614,7 @@ class ImageCaptioningModel:
         display(Audio(filename))
         print(f"Audio saved to {filename}")
     
-    def demo(self, image_path):
+    def demo(self, image_path, filename="caption_audio.mp3"):
         """Run a full demonstration of the model."""
         if not os.path.exists(image_path):
             print(f"Image not found: {image_path}")
@@ -580,37 +638,24 @@ class ImageCaptioningModel:
         self.plot_attention(image_path, words, attention)
         
         # Generate speech
-        self.speak_caption(caption)
+        self.speak_caption(caption, filename=filename)
         
         return caption
 
-
-def main():
-    # Initialize processor and load data
-    processor = DataProcessor(CONFIG)
-    processor.load_captions()
-    processor.display_samples(2)
-    processor.prepare_captions()
-    
-    # Create datasets
-    train_ds, val_ds, test_ds = processor.prepare_datasets()
-    
-    # Build and train model
-    model = ImageCaptioningModel(CONFIG, processor)
-    model.build_model()
-    
-    # Train the model
-    model.train(train_ds, processor.val_data)
-    model.plot_history()
-    
-    # Evaluate on test set
-    print("Evaluating on test set:")
-    model.evaluate_bleu(processor.test_data[:20])
-    
-    # Demo with a sample image
-    sample_img = os.path.join(CONFIG['image_dir'], processor.test_data[0][0])
-    model.demo(sample_img)
-
-
-if __name__ == "__main__":
-    main()
+#--------------
+processor = DataProcessor(CONFIG)
+processor.load_captions()
+processor.display_samples(2)
+processor.prepare_captions(subset_ratio=CONFIG['subset_ratio'])
+train_ds, val_ds, _ = processor.prepare_datasets()
+model = ImageCaptioningModel(CONFIG, processor)
+model.build_model()
+model.summary()
+model.train(train_ds, processor.val_data)
+model.plot_history()
+model.evaluate_bleu(processor.test_data[:20])
+sample_img = os.path.join(CONFIG['image_dir'], processor.test_data[0][0])
+model.demo(sample_img, filename='caption_audio01.mp3')
+sample_pair = random.choice(processor.test_data)
+sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
+model.demo(sample_img, filename='caption_audio02.mp3')
