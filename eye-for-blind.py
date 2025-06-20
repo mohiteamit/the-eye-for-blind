@@ -15,7 +15,7 @@
 # 3. Employs a decoder LSTM to generate captions.
 # 4. Converts generated captions to speech using gTTS.
 
-# In[ ]:
+# In[1]:
 
 
 import os
@@ -46,7 +46,7 @@ from IPython.display import Audio, display
 import tqdm
 
 
-# In[ ]:
+# In[2]:
 
 
 CONFIG = {
@@ -80,7 +80,7 @@ CONFIG = {
 }
 
 
-# In[ ]:
+# In[3]:
 
 
 # Set random seeds for reproducibility
@@ -112,7 +112,7 @@ else:
 AUTOTUNE = tf.data.AUTOTUNE
 
 
-# In[ ]:
+# In[4]:
 
 
 class DataProcessor:
@@ -319,7 +319,7 @@ class DataProcessor:
         return train_ds, val_ds, test_ds
 
 
-# In[ ]:
+# In[5]:
 
 
 class Encoder(Model):
@@ -349,7 +349,7 @@ class Encoder(Model):
         return self.reshape(x)                                     # (B,64,2048)
 
 
-# In[ ]:
+# In[6]:
 
 
 class BahdanauAttention(layers.Layer):
@@ -367,7 +367,7 @@ class BahdanauAttention(layers.Layer):
         return context_vector, tf.squeeze(attention_weights, -1)
 
 
-# In[ ]:
+# In[7]:
 
 
 class Decoder(Model):
@@ -413,7 +413,7 @@ class Decoder(Model):
         return tf.expand_dims(logits, 1), h_t, c_t, alpha
 
 
-# In[ ]:
+# In[8]:
 
 
 class ImageCaptioningModel:
@@ -896,38 +896,38 @@ class ImageCaptioningModel:
         print("CNN fine-tune finished.")
 
 
-# In[ ]:
+# In[9]:
 
 
 processor = DataProcessor(CONFIG)
 
 
-# In[ ]:
+# In[10]:
 
 
-processor.load_captions()
+_ = processor.load_captions()
 
 
-# In[ ]:
+# In[11]:
 
 
 processor.display_samples(2)
 
 
-# In[ ]:
+# In[12]:
 
 
 processor.prepare_captions(subset_ratio=CONFIG['subset_ratio'])[:20]
 
 
-# In[ ]:
+# In[13]:
 
 
 # Create datasets
 train_ds, val_ds, _ = processor.prepare_datasets()
 
 
-# In[ ]:
+# In[14]:
 
 
 # Build and train model
@@ -935,22 +935,21 @@ model = ImageCaptioningModel(CONFIG, processor)
 model.build_model()
 
 
-# In[ ]:
+# In[15]:
 
 
 model.summary()
 
 
-# In[ ]:
+# In[16]:
 
 
-model.prime_dataset(train_ds)
+model.prime_dataset(train_ds, steps=20)
 
 
-# In[ ]:
+# In[17]:
 
 
-# Uncomment to train the model
 model.train(train_ds, processor.val_data)
 
 
