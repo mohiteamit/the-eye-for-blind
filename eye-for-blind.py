@@ -41,10 +41,11 @@ CONFIG = {
     
     # Training Behavior
     'seed': 42,
-    'epochs': 2,                # Slightly more for small dataset
+    'epochs': 2,                 # Slightly more for small dataset
     'patience': 4,               # Early stopping tolerance
     'learning_rate': 3e-4,       # Lower for small datasets to reduce overfitting
     'grad_clip_value': 5.0,      # Prevent exploding gradients
+    'scheduled_sampling_max_prob' : 0.25,    # final ε
     
     # Vocabulary
     'vocab_min_count': 3,        # Include more words for small run
@@ -207,14 +208,28 @@ class DataProcessor:
         return padded_seq, len(seq)
     
     @tf.function(input_signature=[tf.TensorSpec([], tf.string)])
-    def load_image(self, path: str) -> tf.Tensor:
-        """Load and preprocess an image efficiently in graph mode."""
+    def load_image(self, path: tf.Tensor) -> tf.Tensor:
+        """
+        Read → augment → preprocess for Inception-V3.
+        Adds random horizontal flip and random crop (accuracy boost).
+        """
         img = tf.io.read_file(path)
         img = tf.image.decode_jpeg(img, channels=3)
-        img = tf.image.convert_image_dtype(img, dtype=tf.float32)
-        img = tf.image.resize(img, [299, 299])
+        img = tf.image.convert_image_dtype(img, tf.float32)        # [0,1]
+
+        img = tf.image.random_flip_left_right(img)                 # aug ①
+
+        # Resize so the shorter side = 342 then random-crop 299 × 299
+        shape       = tf.shape(img)[:2]                            # (h,w)
+        short_side  = tf.cast(tf.reduce_min(shape), tf.float32)
+        scale       = 342.0 / short_side
+        new_hw      = tf.cast(tf.cast(shape, tf.float32) * scale, tf.int32)
+        img = tf.image.resize(img, new_hw)
+        img = tf.image.random_crop(img, size=[299, 299, 3])        # aug ②
+
+        img = tf.keras.applications.inception_v3.preprocess_input(img)
         img = tf.ensure_shape(img, [299, 299, 3])
-        return tf.keras.applications.inception_v3.preprocess_input(img)
+        return img
 
     def data_generator(self, data):
         """Generator function for dataset creation."""
@@ -259,24 +274,30 @@ class DataProcessor:
         return train_ds, val_ds, test_ds
 
 class Encoder(Model):
+    """
+    Inception-V3 feature extractor with an optional
+    `unfreeze_top_layers()` helper for later fine-tuning.
+    """
     def __init__(self):
         super().__init__(name="encoder")
-        # Use efficient model loading with feature extraction only
         base = tf.keras.applications.InceptionV3(
-            include_top=False, 
-            weights='imagenet',
-            input_shape=(299, 299, 3)
-        )
-        base.trainable = False
-        # Use specific layer for feature extraction
-        output_layer = base.get_layer('mixed10').output
-        self.cnn = Model(inputs=base.input, outputs=output_layer)
-        self.reshape = layers.Reshape((-1, 2048))
-    
-    def call(self, x):
-        x = self.cnn(x)
-        return self.reshape(x)
+            include_top=False, weights='imagenet',
+            input_shape=(299, 299, 3))
+        base.trainable = False                                      # phase-1: frozen
+        self.cnn = Model(inputs=base.input, outputs=base.get_layer('mixed10').output)
+        self.reshape = layers.Reshape((-1, 2048))                  # L=64 for 8×8 grid
 
+    def unfreeze_top_layers(self, n: int = 2):
+        """
+        Fine-tune: unfreeze the last *n* Inception blocks (default: mixed9 & mixed10).
+        Call **after** initial caption training for best accuracy.
+        """
+        for layer in self.cnn.layers[-n:]:
+            layer.trainable = True
+
+    def call(self, x):                                             # (B,299,299,3)
+        x = self.cnn(x)                                            # (B,8,8,2048)
+        return self.reshape(x)                                     # (B,64,2048)
 
 class BahdanauAttention(layers.Layer):
     def __init__(self, units):
@@ -294,78 +315,61 @@ class BahdanauAttention(layers.Layer):
 
 class Decoder(Model):
     """
-    “Show, Attend and Tell”-style soft-attention decoder
-    ----------------------------------------------------
-    Implements the formulation from Xu et al. (2015) including βₜ
-    (a learnable scalar gate that modulates the context vector).
+    Attention decoder with:
+      • β-gate
+      • **max-out** deep-output layer  (improves accuracy a bit)
     """
     def __init__(self, embedding_dim: int, units: int, vocab_size: int):
         super().__init__(name="decoder")
         self.units = units
 
-        # Layers
-        self.embedding   = layers.Embedding(vocab_size, embedding_dim)
-        self.attention   = BahdanauAttention(units)
-        self.f_beta      = layers.Dense(1, activation="sigmoid")   # gate βₜ
-        self.lstm        = layers.LSTM(
-            units,
-            return_sequences=True,
-            return_state=True)
-        self.dropout     = layers.Dropout(0.3)
+        self.embedding = layers.Embedding(vocab_size, embedding_dim)
+        self.attention = BahdanauAttention(units)
+        self.f_beta    = layers.Dense(1, activation="sigmoid")          # βₜ
+        self.lstm      = layers.LSTM(units, return_sequences=True, return_state=True)
+        self.dropout   = layers.Dropout(0.3)
 
-        # Deep-output layer (cf. paper, Eq. (9))
-        self.fc          = layers.Dense(vocab_size)                # W_p
+        # max-out projection: 2 × units → reduce_max → units
+        self.deep_proj = layers.Dense(units * 2)                        # W_o
+        self.fc        = layers.Dense(vocab_size)                       # final soft-max
 
-    def call(
-        self,
-        x: tf.Tensor,                 # (batch, 1)   previous word ids
-        features: tf.Tensor,          # (batch, L, 2048) image annotations
-        hidden: tf.Tensor,            # (batch, units)
-        cell: tf.Tensor               # (batch, units)
-    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-        # 1) Attention using h_{t-1}
-        context, alpha = self.attention(features, hidden)          # (batch, 2048), (batch, L)
+    def call(self, x, features, hidden, cell):
+        context, alpha = self.attention(features, hidden)               # (B,2048)
+        context = self.f_beta(hidden) * context                         # gated
 
-        # 2) Gating scalar βₜ  — “how much to attend”
-        beta    = self.f_beta(hidden)                              # (batch, 1)
-        context = beta * context                                   # (batch, 2048)
+        x = self.embedding(x)                                           # (B,1,E)
+        lstm_input = tf.concat([tf.expand_dims(context, 1), x], -1)     # (B,1,2048+E)
 
-        # 3) Word embedding
-        x = self.embedding(x)                                      # (batch, 1, embed_dim)
-
-        # 4) Concatenate context → input to LSTM
-        lstm_input = tf.concat([tf.expand_dims(context, 1), x], -1)  # (batch, 1, 2048+embed)
-
-        # 5) Re-cast (mixed-precision safety)
         hidden = tf.cast(hidden, lstm_input.dtype)
         cell   = tf.cast(cell,   lstm_input.dtype)
 
-        # 6) Recurrent update
-        lstm_out, h_t, c_t = self.lstm(lstm_input, initial_state=[hidden, cell])  # (batch,1,units)
+        lstm_out, h_t, c_t = self.lstm(lstm_input, initial_state=[hidden, cell])
+        lstm_out = tf.squeeze(lstm_out, 1)                               # (B,units)
 
-        # 7) Deep-output layer  (paper: maxout; we use tanh+linear for simplicity)
-        lstm_out = tf.squeeze(lstm_out, 1)                         # (batch, units)
-        deep_out = tf.concat([lstm_out, context], -1)              # (batch, units+2048)
-        deep_out = self.dropout(deep_out)
-        logits   = self.fc(deep_out)                               # (batch, vocab)
+        # ---------- max-out deep-output layer ----------
+        proj = self.deep_proj(tf.concat([lstm_out, context], -1))        # (B,2*units)
+        proj = tf.reshape(proj, (-1, self.units, 2))                     # (B,units,2)
+        maxout = tf.reduce_max(proj, axis=-1)                            # (B,units)
+        maxout = self.dropout(maxout)
 
-        # Keep time-axis for compatibility with outer code
-        logits = tf.expand_dims(logits, 1)                         # (batch, 1, vocab)
-
-        return logits, h_t, c_t, alpha
+        logits = self.fc(maxout)                                         # (B,vocab)
+        return tf.expand_dims(logits, 1), h_t, c_t, alpha
 
 class ImageCaptioningModel:
     def __init__(self, config, processor):
-        self.config = config
-        self.processor = processor
-        self.encoder = None
-        self.decoder = None
-        self.optimizer = None
-        self.loss_fn = None
-        self.ckpt_manager = None
-        self.best_bleu = 0
-        self.train_loss_log = []
-        self.val_bleu_log = []
+        self.config          = config
+        self.processor       = processor
+        self.encoder         = None
+        self.decoder         = None
+        self.optimizer       = None
+        self.loss_fn         = None
+        self.ckpt_manager    = None
+
+        self.best_bleu       = 0.0
+        self.train_loss_log  = []
+        self.train_bleu_log  = []
+        self.val_bleu_log    = []
+
         self.smoothie = SmoothingFunction().method4
     
     def build_model(self):
@@ -430,81 +434,159 @@ class ImageCaptioningModel:
         self.decoder(dummy_token, dummy_features, dummy_hidden, dummy_cell)
         self.decoder.summary()
 
-
     @tf.function
     def train_step(self,
                    img_tensor: tf.Tensor,
                    target:     tf.Tensor,
                    cap_len:    tf.Tensor) -> tf.Tensor:
         """
-        Single training step with *doubly-stochastic* attention
-        regularisation from “Show, Attend and Tell”.
+        Single step with:
+        • β-gated attention + doubly-stochastic regulariser   (already present)
+        • **Scheduled sampling** controlled by `self.ss_prob`.
         """
-        if self.encoder is None or self.decoder is None:
-            raise ValueError("Models not built. Call build_model() first.")
-
         batch_size = tf.shape(img_tensor)[0]
         hidden     = tf.zeros((batch_size, self.config['units']))
         cell       = tf.zeros_like(hidden)
 
-        # <start> token
         start_tok  = self.processor.tokenizer.word_index['<start>']
         dec_input  = tf.expand_dims(tf.repeat(start_tok, batch_size), 1)
 
-        attention_accum = None   # to store Σ_t α_{t,i}
-        total_loss      = 0.0
+        attention_accum = None
+        total_ce_loss   = 0.0
 
         with tf.GradientTape() as tape:
-            features = self.encoder(img_tensor)                    # (B, L, 2048)
+            features = self.encoder(img_tensor)  # (B, L, 2048)
 
-            # iterate over caption timesteps
-            for t in range(1, self.config['max_length']):
+            for t in tf.range(1, self.config['max_length']):
                 logits, hidden, cell, alpha = self.decoder(
                     dec_input, features, hidden, cell)
 
-                # accumulate attention weights for regularisation
-                if attention_accum is None:
-                    attention_accum = alpha
-                else:
-                    attention_accum += alpha                       # element-wise Σ_t α_{t,i}
+                # accumulate α for doubly-stochastic term
+                attention_accum = (alpha if attention_accum is None
+                                   else attention_accum + alpha)
 
-                # standard X-entropy loss
-                loss_t = self.loss_fn(target[:, t],
-                                      tf.squeeze(logits, 1))       # (B,)
-                mask   = tf.cast(target[:, t] > 0, tf.float32)
-                total_loss += tf.reduce_sum(loss_t * mask)
+                # CE loss
+                ce_t  = self.loss_fn(target[:, t], tf.squeeze(logits, 1))
+                mask  = tf.cast(target[:, t] > 0, tf.float32)
+                total_ce_loss += tf.reduce_sum(ce_t * mask)
 
-                # teacher forcing
-                dec_input = tf.expand_dims(target[:, t], 1)
+                # ---- scheduled sampling decision ----
+                # predicted tokens
+                pred_ids = tf.argmax(logits, -1, output_type=tf.int32)  # (B,1) → (B,)
+                pred_ids = tf.squeeze(pred_ids, -1)
 
-            # normalise by number of real tokens
+                # Bernoulli mask: 1 → use prediction
+                ss_mask = tf.random.uniform((batch_size,)) < self.ss_prob
+                next_ids = tf.where(ss_mask, pred_ids, target[:, t])
+
+                dec_input = tf.expand_dims(next_ids, 1)
+
+            # normalise CE by real tokens
             total_tokens = tf.reduce_sum(tf.cast(cap_len, tf.float32))
-            ce_loss      = total_loss / total_tokens
+            ce_loss      = total_ce_loss / total_tokens
 
-            # ---- doubly-stochastic attention regulariser (Eq. (14)) ----
-            lambda_reg   = self.config.get('attention_reg_lambda', 1.0)
-            # Σ_i (1 − Σ_t α_{t,i})²  averaged over batch
-            reg_loss = tf.reduce_mean(tf.square(1.0 - attention_accum))
-            loss     = ce_loss + lambda_reg * reg_loss
+            # doubly-stochastic regulariser
+            lambda_reg = self.config.get('attention_reg_lambda', 1.0)
+            reg_loss   = tf.reduce_mean(tf.square(1.0 - attention_accum))
+            loss       = ce_loss + lambda_reg * reg_loss
 
-            # mixed-precision safety
             if self.config['mixed_precision']:
                 loss = tf.cast(loss, tf.float32)
 
-        # gradients & update
-        variables  = self.encoder.trainable_variables + self.decoder.trainable_variables
-        grads      = tape.gradient(loss, variables)
+        variables = self.encoder.trainable_variables + self.decoder.trainable_variables
+        grads     = tape.gradient(loss, variables)
 
         if self.config['mixed_precision']:
             grads = [tf.cast(g, tf.float32) if g is not None else None
                      for g in grads]
 
-        # clip to prevent exploding gradients
         grads, _ = tf.clip_by_global_norm(grads, self.config['grad_clip_value'])
         self.optimizer.apply_gradients(zip(grads, variables))
 
         return loss
-    
+
+    def beam_search_decode(self,
+                           image_path: str,
+                           beam_size: int = 5,
+                           length_penalty: float = 0.7,
+                           return_attention: bool = False):
+        """
+        Beam-search inference (≈ +1 BLEU vs greedy).
+        `length_penalty` > 0 favours longer sentences.
+        """
+        # ---- feature extraction (shared across beams) ----
+        img_tensor = tf.expand_dims(
+            self.processor.load_image(tf.convert_to_tensor(image_path)), 0)
+        base_features = self.encoder(img_tensor)                         # (1,L,2048)
+
+        start_id = self.processor.tokenizer.word_index['<start>']
+        end_id   = self.processor.tokenizer.word_index['<end>']
+
+        Beam = dict  # shorthand for readability
+        beams: List[Beam] = [{
+            'seq':   [start_id],
+            'score': 0.0,
+            'hidden': tf.zeros((1, self.config['units'])),
+            'cell':   tf.zeros((1, self.config['units'])),
+            'alphas': []
+        }]
+
+        completed: List[Beam] = []
+
+        for _ in range(self.config['max_length']):
+            candidates: List[Beam] = []
+            for b in beams:
+                last_id = b['seq'][-1]
+
+                # if already ended, keep it
+                if last_id == end_id:
+                    completed.append(b)
+                    continue
+
+                dec_in = tf.expand_dims([last_id], 0)                    # (1,1)
+                logits, h, c, alpha = self.decoder(
+                    dec_in, base_features, b['hidden'], b['cell'])
+
+                log_probs = tf.nn.log_softmax(logits[0, 0])              # (vocab,)
+                top_ids   = tf.math.top_k(log_probs, k=beam_size).indices.numpy()
+
+                for tok in top_ids:
+                    tok = int(tok)
+                    new_b = {
+                        'seq':   b['seq'] + [tok],
+                        'score': b['score'] + float(log_probs[tok]),
+                        'hidden': h,
+                        'cell':   c,
+                        'alphas': b['alphas'] + [alpha[0].numpy()]
+                    }
+                    candidates.append(new_b)
+
+            if not candidates:
+                break
+
+            # length-penalised sorting
+            def lp(b):
+                lp_den = (len(b['seq']) ** length_penalty)
+                return b['score'] / lp_den
+
+            candidates.sort(key=lp, reverse=True)
+            beams = candidates[:beam_size]
+
+            # if enough completed beams gathered, we can stop
+            if len(completed) >= beam_size:
+                break
+
+        best = max(completed + beams, key=lambda b: b['score'] / (len(b['seq']) ** length_penalty))
+
+        words = []
+        for idx in best['seq']:
+            w = self.processor.tokenizer.index_word.get(idx, '')
+            if w in ('<start>', '<end>', '<unk>'):
+                continue
+            words.append(w)
+
+        return (words, best['alphas']) if return_attention else words
+
     def greedy_decode(self, image_path: str, return_attention=False):
         """Generate a caption for an image using greedy decoding."""
         # Convert Python string -> tf.Tensor to match load_image() signature
@@ -539,7 +621,6 @@ class ImageCaptioningModel:
 
         return (result, alphas) if return_attention else result
 
-    
     def evaluate_bleu(self, test_data, max_samples=None):
         """Calculate BLEU scores on test data."""
         refs, hyps = [], []
@@ -567,60 +648,63 @@ class ImageCaptioningModel:
         return bleu_scores
     
     def train(self, train_ds, val_data, epochs=None):
-        """Train the model with early stopping."""
+        """
+        Same as before *plus*:
+        • compute BLEU-4 on a 100-image TRAIN subset each epoch
+          and store it in self.train_bleu_log (so we can plot it).
+        """
         if epochs is None:
             epochs = self.config['epochs']
-        
+
+        self.ss_max_prob = self.config.get('scheduled_sampling_max_prob', 0.0)
         patience = self.config['patience']
-        wait = 0
-        
+        wait     = 0
+
         for epoch in range(epochs):
-            start = time.time()
-            total_loss = 0.0
-            step = 0
-            
-            # Training loop
-            print(f"Epoch {epoch+1}/{epochs}")
-            progbar = tf.keras.utils.Progbar(
-                target=None,
-                stateful_metrics=['loss']
-            )
-            
+            # ------- scheduled-sampling ε for this epoch -------
+            self.ss_prob = self.ss_max_prob * epoch / max(1, epochs - 1)
+            print(f"\nEpoch {epoch+1}/{epochs}  (ε = {self.ss_prob:.3f})")
+
+            start, total_loss, step = time.time(), 0.0, 0
+            progbar = tf.keras.utils.Progbar(target=None, stateful_metrics=['loss'])
+
             for batch, (img_tensor, target, cap_len) in enumerate(train_ds):
                 if batch == 0 and progbar.target is None:
                     progbar.target = len(self.processor.train_data) // self.config['batch_size'] + 1
-                
+
                 batch_loss = self.train_step(img_tensor, target, cap_len)
                 total_loss += batch_loss
                 progbar.update(batch + 1, values=[('loss', batch_loss)])
                 step += 1
-            
-            # Average loss for the epoch
+
             avg_loss = total_loss / step
             self.train_loss_log.append(float(avg_loss))
-            
-            # Save checkpoint
+
+            # ------- quick BLEU on 100-image TRAIN subset -------
+            train_subset = self.processor.train_data[:100]
+            train_bleu   = self.evaluate_bleu(train_subset)['bleu-4']
+            self.train_bleu_log.append(train_bleu)
+
+            # ------- BLEU on VAL subset -------
+            val_bleu = self.evaluate_bleu(val_data[:100])['bleu-4']
+            self.val_bleu_log.append(val_bleu)
+
+            # ------- checkpoint & early-stopping -------
             self.ckpt_manager.save()
-            
-            # Validation on a subset for speed
-            print("Evaluating on validation subset...")
-            validation_subset = val_data[:100]
-            bleu_scores = self.evaluate_bleu(validation_subset)
-            bleu4 = bleu_scores['bleu-4']
-            self.val_bleu_log.append(bleu4)
-            
-            # Early stopping logic
-            if bleu4 > self.best_bleu:
-                self.best_bleu = bleu4
+            if val_bleu > self.best_bleu:
+                self.best_bleu = val_bleu
                 wait = 0
             else:
                 wait += 1
                 if wait >= patience:
-                    print(f"Early stopping triggered at epoch {epoch+1}")
+                    print(f"Early stopping at epoch {epoch+1}")
                     break
-            
-            print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}, BLEU-4 = {bleu4:.4f}, Time = {time.time()-start:.2f}s", flush=True)
-        
+
+            print(f"Epoch {epoch+1}: loss={avg_loss:.4f}  "
+                  f"train-BLEU={train_bleu:.4f}  val-BLEU={val_bleu:.4f}  "
+                  f"time={time.time()-start:.1f}s",
+                  flush=True)
+
         return self.train_loss_log, self.val_bleu_log
     
     def plot_attention(self, image_path: str, caption: list, alphas: list):
@@ -643,25 +727,29 @@ class ImageCaptioningModel:
         plt.show()
     
     def plot_history(self):
-        """Plot training history."""
-        plt.figure(figsize=(12, 5))
-        
+        """Plot loss curve **and** both train/val BLEU-4 curves."""
+        plt.figure(figsize=(14, 5))
+
+        # --- left: training loss ---
         plt.subplot(1, 2, 1)
         plt.plot(self.train_loss_log, label='Train Loss')
         plt.xlabel('Epoch')
-        plt.ylabel('Loss')
+        plt.ylabel('Cross-Entropy Loss')
         plt.title('Training Loss')
-        plt.legend()
         plt.grid(True)
-        
+        plt.legend()
+
+        # --- right: BLEU-4 ---
         plt.subplot(1, 2, 2)
-        plt.plot(self.val_bleu_log, label='Val BLEU-4')
+        if self.train_bleu_log:
+            plt.plot(self.train_bleu_log, label='Train BLEU-4')
+        plt.plot(self.val_bleu_log,   label='Val BLEU-4')
         plt.xlabel('Epoch')
         plt.ylabel('BLEU-4')
-        plt.title('Validation BLEU-4')
-        plt.legend()
+        plt.title('BLEU-4 Scores')
         plt.grid(True)
-        
+        plt.legend()
+
         plt.tight_layout()
         plt.show()
     
@@ -676,33 +764,80 @@ class ImageCaptioningModel:
         display(Audio(filename))
         print(f"Audio saved to {filename}")
     
-    def demo(self, image_path, filename="caption_audio.mp3"):
-        """Run a full demonstration of the model."""
+    def demo(self,
+             image_path: str,
+             filename: str = "caption_audio.mp3",
+             beam_size: int = 5,
+             length_penalty: float = 0.7):
+        """
+        End-to-end demo (beam-search inference) in the following order:
+          1. Original image
+          2. Ground-truth captions
+          3. Generated caption
+          4. Audio playback
+          5. Attention heat-maps
+        """
         if not os.path.exists(image_path):
             print(f"Image not found: {image_path}")
             return
-            
-        print(f"Generating caption for: {image_path}")
-        
-        # Display the image
+
+        # ---------- 1. original image ----------
         img = Image.open(image_path)
         plt.figure(figsize=(8, 6))
         plt.imshow(img)
         plt.axis('off')
         plt.show()
-        
-        # Generate caption with attention
-        words, attention = self.greedy_decode(image_path, return_attention=True)
+
+        # ---------- 2. ground-truth captions ----------
+        img_name = os.path.basename(image_path)
+        gt_caps = self.processor.captions_dict.get(img_name, [])
+        if gt_caps:
+            print("Ground-truth captions:")
+            for cap in gt_caps:
+                print(f"- {cap}")
+        else:
+            print("No ground-truth captions found.")
+
+        # ---------- 3. caption generation ----------
+        words, attention = self.beam_search_decode(
+            image_path,
+            beam_size=beam_size,
+            length_penalty=length_penalty,
+            return_attention=True
+        )
         caption = " ".join(words)
-        print(f"Generated caption: {caption}")
-        
-        # Plot attention
-        self.plot_attention(image_path, words, attention)
-        
-        # Generate speech
+        print("\nGenerated caption:")
+        print(caption)
+
+        # ---------- 4. audio ----------
         self.speak_caption(caption, filename=filename)
-        
+
+        # ---------- 5. attention plot ----------
+        self.plot_attention(image_path, words, attention)
+
         return caption
+
+
+    def fine_tune_cnn(self,
+                      train_ds,
+                      val_data,
+                      layers_to_unfreeze: int = 2,
+                      lr: float = 1e-5,
+                      epochs: int = 1):
+        """
+        Phase-2 fine-tuning of the top Inception blocks.
+        Call after initial caption training for an extra accuracy bump.
+        """
+        print(f"\nUnfreezing top {layers_to_unfreeze} Inception blocks …")
+        self.encoder.unfreeze_top_layers(layers_to_unfreeze)
+
+        # New, low learning-rate optimiser
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+        print(f"Fine-tuning CNN for {epochs} epoch(s) at lr={lr} …")
+        self.train(train_ds, val_data, epochs=epochs)
+
+        print("CNN fine-tune finished.")
 
 #--------------
 processor = DataProcessor(CONFIG)
@@ -714,6 +849,7 @@ model = ImageCaptioningModel(CONFIG, processor)
 model.build_model()
 model.summary()
 model.train(train_ds, processor.val_data)
+model.fine_tune_cnn(train_ds, processor.val_data, layers_to_unfreeze=2, lr=1e-5, epochs=2)
 model.plot_history()
 model.evaluate_bleu(processor.test_data[:20])
 sample_img = os.path.join(CONFIG['image_dir'], processor.test_data[0][0])
