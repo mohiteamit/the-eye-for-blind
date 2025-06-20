@@ -1,8 +1,30 @@
-"""
-Here my current code. Consume I will give you specific instructions or questions based on code. Always respond to question with only required information, no additional information needed unless asked. When a function updates, always provide complete updated code.
+#!/usr/bin/env python
+# coding: utf-8
 
-"""
+# # Eye for Blind – Image Captioning with Attention
+
+# # 1. Objective
+# 
+# Eye for Blind: An Assistive Image Captioning System with Visual Attention
+# 
+# This project implements a deep learning model that generates natural language descriptions of images, particularly aimed at visually impaired users. The model leverages an attention mechanism to selectively focus on image regions when generating each word, mimicking human vision.
+# 
+# Inspired by "Show, Attend and Tell" (Xu et al., 2015), this implementation:
+# 1. Uses a CNN encoder (InceptionV3) to extract image features.
+# 2. Applies additive (Bahdanau) attention during decoding.
+# 3. Employs a decoder LSTM to generate captions.
+# 4. Converts generated captions to speech using gTTS.
+
+# In[ ]:
+
+
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# 0 (default): All messages (INFO, WARNING, ERROR) are logged.
+# 1: INFO messages are not printed.
+# 2: INFO and WARNING messages are not printed.
+# 3: INFO, WARNING, and ERROR messages are not printed.
+
 import re
 import time
 import random
@@ -23,7 +45,9 @@ from gtts import gTTS #type: ignore
 from IPython.display import Audio, display
 import tqdm
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# In[ ]:
+
 
 CONFIG = {
     'subset_ratio' : 1.0,
@@ -31,7 +55,7 @@ CONFIG = {
     'caption_file': '/home/flickr30k_images/flickr30k_images/results.csv',
     
     # GPU Utilization
-    'batch_size': 256,           # Fully utilize 48GB VRAM; reduce if OOM
+    'batch_size': 128,           # Fully utilize 48GB VRAM; reduce if OOM
     'buffer_size': 10000,        # Larger shuffle buffer helps training stability
     
     # Model Capacity
@@ -41,8 +65,8 @@ CONFIG = {
     
     # Training Behavior
     'seed': 42,
-    'epochs': 2,                 # Slightly more for small dataset
-    'patience': 4,               # Early stopping tolerance
+    'epochs': 20,                # Slightly more for small dataset
+    'patience': 8,               # Early stopping tolerance
     'learning_rate': 3e-4,       # Lower for small datasets to reduce overfitting
     'grad_clip_value': 5.0,      # Prevent exploding gradients
     'scheduled_sampling_max_prob' : 0.25,    # final ε
@@ -54,6 +78,10 @@ CONFIG = {
     'checkpoint_dir': './checkpoints/10pct',
     'mixed_precision': False,     # RTX 6000 Ada has 4th-gen Tensor Cores—use them
 }
+
+
+# In[ ]:
+
 
 # Set random seeds for reproducibility
 tf.random.set_seed(CONFIG['seed'])
@@ -82,6 +110,10 @@ else:
 
 # Constants
 AUTOTUNE = tf.data.AUTOTUNE
+
+
+# In[ ]:
+
 
 class DataProcessor:
     def __init__(self, config):
@@ -131,7 +163,7 @@ class DataProcessor:
                 print()
             except Exception as e:
                 print(f"Error loading image {key}: {e}")
-    
+
     def preprocess_caption(self, caption: str) -> Optional[str]:
         """Clean and format caption text."""
         if caption is None or not isinstance(caption, str):
@@ -139,7 +171,7 @@ class DataProcessor:
         caption = caption.lower()
         caption = re.sub(r"[^a-z0-9.,? ]", "", caption)
         return f"<start> {caption.strip()} <end>"
-    
+
     def prepare_captions(self, subset_ratio=1.0):
         """Process captions, build tokenizer & train/val/test splits."""
         if not self.captions_dict:
@@ -196,7 +228,6 @@ class DataProcessor:
         print(f"split  →  train {len(self.train_data)} | val {len(self.val_data)} | test {len(self.test_data)}")
 
         return filtered
-
         
     def encode_caption(self, caption: str) -> Tuple[np.ndarray, int]:
         """Convert caption text to sequence of token ids."""
@@ -206,40 +237,54 @@ class DataProcessor:
         seq = self.tokenizer.texts_to_sequences([caption])[0]
         padded_seq = pad_sequences([seq], maxlen=self.config['max_length'], padding='post')[0]
         return padded_seq, len(seq)
-    
+
     @tf.function(input_signature=[tf.TensorSpec([], tf.string)])
-    def load_image(self, path: tf.Tensor) -> tf.Tensor:
-        """
-        Read → augment → preprocess for Inception-V3.
-        Adds random horizontal flip and random crop (accuracy boost).
-        """
+    def _base_decode(self, path: tf.Tensor) -> tf.Tensor:
         img = tf.io.read_file(path)
         img = tf.image.decode_jpeg(img, channels=3)
-        img = tf.image.convert_image_dtype(img, tf.float32)        # [0,1]
+        img = tf.image.convert_image_dtype(img, tf.float32)          # [0,1]
+        return img                                                   # (h,w,3)
 
-        img = tf.image.random_flip_left_right(img)                 # aug ①
+    @tf.function(input_signature=[tf.TensorSpec([], tf.string)])
+    def load_image_train(self, path: tf.Tensor) -> tf.Tensor:
+        """Augment + preprocess (training only)."""
+        img = self._base_decode(path)
+        img = tf.image.random_flip_left_right(img)                   # aug ①
 
-        # Resize so the shorter side = 342 then random-crop 299 × 299
-        shape       = tf.shape(img)[:2]                            # (h,w)
-        short_side  = tf.cast(tf.reduce_min(shape), tf.float32)
-        scale       = 342.0 / short_side
-        new_hw      = tf.cast(tf.cast(shape, tf.float32) * scale, tf.int32)
+        # resize shorter side→342 then *random* crop 299×299
+        shape = tf.shape(img)[:2]
+        scale = 342. / tf.cast(tf.reduce_min(shape), tf.float32)
+        new_hw = tf.cast(tf.cast(shape, tf.float32) * scale, tf.int32)
         img = tf.image.resize(img, new_hw)
-        img = tf.image.random_crop(img, size=[299, 299, 3])        # aug ②
+        img = tf.image.random_crop(img, size=[299, 299, 3])          # aug ②
 
         img = tf.keras.applications.inception_v3.preprocess_input(img)
-        img = tf.ensure_shape(img, [299, 299, 3])
-        return img
+        return tf.ensure_shape(img, [299, 299, 3])
+
+    @tf.function(input_signature=[tf.TensorSpec([], tf.string)])
+    def load_image_eval(self, path: tf.Tensor) -> tf.Tensor:
+        """Deterministic centre-crop (validation / inference)."""
+        img = self._base_decode(path)
+
+        # resize shorter side→342 then *central* crop 299×299
+        shape = tf.shape(img)[:2]
+        scale = 342. / tf.cast(tf.reduce_min(shape), tf.float32)
+        new_hw = tf.cast(tf.cast(shape, tf.float32) * scale, tf.int32)
+        img = tf.image.resize(img, new_hw)
+        img = tf.image.resize_with_crop_or_pad(img, 299, 299)
+
+        img = tf.keras.applications.inception_v3.preprocess_input(img)
+        return tf.ensure_shape(img, [299, 299, 3])
 
     def data_generator(self, data):
-        """Generator function for dataset creation."""
+        """Generator for *training* / *val* datasets."""
         for img, cap in data:
             img_path = os.path.join(self.config['image_dir'], img)
-            img_tensor = self.load_image(tf.convert_to_tensor(img_path))
+            img_tensor = self.load_image_train(tf.convert_to_tensor(img_path))
             token_ids, cap_len = self.encode_caption(cap)
             yield img_tensor, token_ids, cap_len
     
-    def build_dataset(self, data, shuffle=True, cache=True):
+    def build_dataset(self, data, shuffle=True, cache=True, training: bool=True):
         """Create a tf.data.Dataset optimized for single GPU."""
         output_signature = (
             tf.TensorSpec((299, 299, 3), tf.float32),
@@ -273,6 +318,10 @@ class DataProcessor:
         
         return train_ds, val_ds, test_ds
 
+
+# In[ ]:
+
+
 class Encoder(Model):
     """
     Inception-V3 feature extractor with an optional
@@ -299,6 +348,10 @@ class Encoder(Model):
         x = self.cnn(x)                                            # (B,8,8,2048)
         return self.reshape(x)                                     # (B,64,2048)
 
+
+# In[ ]:
+
+
 class BahdanauAttention(layers.Layer):
     def __init__(self, units):
         super().__init__(name="attention")
@@ -312,6 +365,10 @@ class BahdanauAttention(layers.Layer):
         attention_weights = tf.nn.softmax(score, axis=1)
         context_vector = tf.reduce_sum(attention_weights * features, axis=1)
         return context_vector, tf.squeeze(attention_weights, -1)
+
+
+# In[ ]:
+
 
 class Decoder(Model):
     """
@@ -355,6 +412,10 @@ class Decoder(Model):
         logits = self.fc(maxout)                                         # (B,vocab)
         return tf.expand_dims(logits, 1), h_t, c_t, alpha
 
+
+# In[ ]:
+
+
 class ImageCaptioningModel:
     def __init__(self, config, processor):
         self.config          = config
@@ -369,6 +430,7 @@ class ImageCaptioningModel:
         self.train_loss_log  = []
         self.train_bleu_log  = []
         self.val_bleu_log    = []
+        self.bleu_subset_idx = None  
 
         self.smoothie = SmoothingFunction().method4
     
@@ -510,112 +572,79 @@ class ImageCaptioningModel:
                            beam_size: int = 5,
                            length_penalty: float = 0.7,
                            return_attention: bool = False):
-        """
-        Beam-search inference (≈ +1 BLEU vs greedy).
-        `length_penalty` > 0 favours longer sentences.
-        """
-        # ---- feature extraction (shared across beams) ----
+        """Beam-search with deterministic crop."""
         img_tensor = tf.expand_dims(
-            self.processor.load_image(tf.convert_to_tensor(image_path)), 0)
-        base_features = self.encoder(img_tensor)                         # (1,L,2048)
+            self.processor.load_image_eval(tf.convert_to_tensor(image_path)), 0
+        )
+        base_features = self.encoder(img_tensor)       # (1,L,2048)
 
         start_id = self.processor.tokenizer.word_index['<start>']
         end_id   = self.processor.tokenizer.word_index['<end>']
 
-        Beam = dict  # shorthand for readability
-        beams: List[Beam] = [{
-            'seq':   [start_id],
-            'score': 0.0,
-            'hidden': tf.zeros((1, self.config['units'])),
-            'cell':   tf.zeros((1, self.config['units'])),
-            'alphas': []
-        }]
+        beams = [{'seq':[start_id],
+                  'score':0.0,
+                  'hidden':tf.zeros((1,self.config['units'])),
+                  'cell':tf.zeros((1,self.config['units'])),
+                  'alphas':[]}]
 
-        completed: List[Beam] = []
-
+        completed = []
         for _ in range(self.config['max_length']):
-            candidates: List[Beam] = []
+            candidates = []
             for b in beams:
                 last_id = b['seq'][-1]
-
-                # if already ended, keep it
                 if last_id == end_id:
-                    completed.append(b)
-                    continue
-
-                dec_in = tf.expand_dims([last_id], 0)                    # (1,1)
-                logits, h, c, alpha = self.decoder(
-                    dec_in, base_features, b['hidden'], b['cell'])
-
-                log_probs = tf.nn.log_softmax(logits[0, 0])              # (vocab,)
-                top_ids   = tf.math.top_k(log_probs, k=beam_size).indices.numpy()
-
+                    completed.append(b); continue
+                dec_in = tf.expand_dims([last_id], 0)
+                logits, h, c, alpha = self.decoder(dec_in, base_features,
+                                                   b['hidden'], b['cell'])
+                log_probs = tf.nn.log_softmax(logits[0,0])
+                top_ids = tf.math.top_k(log_probs, k=beam_size).indices.numpy()
                 for tok in top_ids:
                     tok = int(tok)
-                    new_b = {
-                        'seq':   b['seq'] + [tok],
-                        'score': b['score'] + float(log_probs[tok]),
-                        'hidden': h,
-                        'cell':   c,
-                        'alphas': b['alphas'] + [alpha[0].numpy()]
-                    }
-                    candidates.append(new_b)
-
-            if not candidates:
-                break
-
-            # length-penalised sorting
-            def lp(b):
-                lp_den = (len(b['seq']) ** length_penalty)
-                return b['score'] / lp_den
-
+                    candidates.append({
+                        'seq':   b['seq']+[tok],
+                        'score': b['score']+float(log_probs[tok]),
+                        'hidden':h,
+                        'cell':  c,
+                        'alphas':b['alphas']+[alpha[0].numpy()]})
+            if not candidates: break
+            def lp(b): return b['score']/(len(b['seq'])**length_penalty)
             candidates.sort(key=lp, reverse=True)
             beams = candidates[:beam_size]
+            if len(completed) >= beam_size: break
 
-            # if enough completed beams gathered, we can stop
-            if len(completed) >= beam_size:
-                break
-
-        best = max(completed + beams, key=lambda b: b['score'] / (len(b['seq']) ** length_penalty))
-
-        words = []
-        for idx in best['seq']:
-            w = self.processor.tokenizer.index_word.get(idx, '')
-            if w in ('<start>', '<end>', '<unk>'):
-                continue
-            words.append(w)
-
+        best = max(completed+beams,
+                   key=lambda b: b['score']/(len(b['seq'])**length_penalty))
+        words = [self.processor.tokenizer.index_word.get(i,'')
+                 for i in best['seq']
+                 if self.processor.tokenizer.index_word.get(i,'') not in
+                 ('<start>','<end>','<unk>')]
         return (words, best['alphas']) if return_attention else words
 
     def greedy_decode(self, image_path: str, return_attention=False):
-        """Generate a caption for an image using greedy decoding."""
-        # Convert Python string -> tf.Tensor to match load_image() signature
+        """Generate caption via greedy decoding (deterministic crop)."""
         img_tensor = tf.expand_dims(
-            self.processor.load_image(tf.convert_to_tensor(image_path)),
-            0
+            self.processor.load_image_eval(tf.convert_to_tensor(image_path)), 0
         )
 
         features = self.encoder(img_tensor)
-        hidden  = tf.zeros((1, self.config['units']))
-        cell    = tf.zeros_like(hidden)
+        hidden = tf.zeros((1, self.config['units']))
+        cell   = tf.zeros_like(hidden)
         dec_input = tf.expand_dims(
             [self.processor.tokenizer.word_index['<start>']], 0
         )
 
         result, alphas = [], []
-
         for _ in range(self.config['max_length']):
             logits, hidden, cell, alpha = self.decoder(
                 dec_input, features, hidden, cell
             )
             pred_id = tf.argmax(logits[0, 0]).numpy()
             word = self.processor.tokenizer.index_word.get(pred_id, '')
-
             if word == '<end>':
                 break
             if word not in ('<start>', '<unk>'):
                 result.append(word)
-
             alphas.append(alpha[0].numpy())
             dec_input = tf.expand_dims([pred_id], 0)
 
@@ -647,26 +676,35 @@ class ImageCaptioningModel:
         
         return bleu_scores
     
-    def train(self, train_ds, val_data, epochs=None):
+    def train(self, train_ds, val_data, epochs=None, subset_size: int = 200):
         """
-        Same as before *plus*:
-        • compute BLEU-4 on a 100-image TRAIN subset each epoch
-          and store it in self.train_bleu_log (so we can plot it).
+        Train with:
+          • fixed |subset_size| random train images for quick BLEU tracking
+          • full validation split for early-stop decision
         """
         if epochs is None:
             epochs = self.config['epochs']
 
+        # pick subset indices once
+        if self.bleu_subset_idx is None:
+            total_train = len(self.processor.train_data)
+            subset_size = min(subset_size, total_train)
+            self.bleu_subset_idx = random.sample(range(total_train), subset_size)
+
+        def _subset(data, idx):
+            return [data[i] for i in idx]
+
+        patience      = self.config['patience']
+        wait          = 0
         self.ss_max_prob = self.config.get('scheduled_sampling_max_prob', 0.0)
-        patience = self.config['patience']
-        wait     = 0
 
         for epoch in range(epochs):
-            # ------- scheduled-sampling ε for this epoch -------
+            # scheduled-sampling ε
             self.ss_prob = self.ss_max_prob * epoch / max(1, epochs - 1)
             print(f"\nEpoch {epoch+1}/{epochs}  (ε = {self.ss_prob:.3f})")
 
             start, total_loss, step = time.time(), 0.0, 0
-            progbar = tf.keras.utils.Progbar(target=None, stateful_metrics=['loss'])
+            progbar = tf.keras.utils.Progbar(None, stateful_metrics=['loss'])
 
             for batch, (img_tensor, target, cap_len) in enumerate(train_ds):
                 if batch == 0 and progbar.target is None:
@@ -680,16 +718,16 @@ class ImageCaptioningModel:
             avg_loss = total_loss / step
             self.train_loss_log.append(float(avg_loss))
 
-            # ------- quick BLEU on 100-image TRAIN subset -------
-            train_subset = self.processor.train_data[:100]
+            # ------ quick BLEU on fixed TRAIN subset ------
+            train_subset = _subset(self.processor.train_data, self.bleu_subset_idx)
             train_bleu   = self.evaluate_bleu(train_subset)['bleu-4']
             self.train_bleu_log.append(train_bleu)
 
-            # ------- BLEU on VAL subset -------
-            val_bleu = self.evaluate_bleu(val_data[:100])['bleu-4']
+            # ------ BLEU on *full* VAL split ------
+            val_bleu = self.evaluate_bleu(val_data)['bleu-4']   # no slicing
             self.val_bleu_log.append(val_bleu)
 
-            # ------- checkpoint & early-stopping -------
+            # ------ checkpoint & early-stopping ------
             self.ckpt_manager.save()
             if val_bleu > self.best_bleu:
                 self.best_bleu = val_bleu
@@ -702,8 +740,7 @@ class ImageCaptioningModel:
 
             print(f"Epoch {epoch+1}: loss={avg_loss:.4f}  "
                   f"train-BLEU={train_bleu:.4f}  val-BLEU={val_bleu:.4f}  "
-                  f"time={time.time()-start:.1f}s",
-                  flush=True)
+                  f"time={time.time()-start:.1f}s", flush=True)
 
         return self.train_loss_log, self.val_bleu_log
     
@@ -815,8 +852,27 @@ class ImageCaptioningModel:
         # ---------- 5. attention plot ----------
         self.plot_attention(image_path, words, attention)
 
-        return caption
 
+    def prime_dataset(self, ds, steps: int = None) -> None:
+        """
+        Pre-fill a tf.data shuffle buffer so the first training epoch
+        starts without the usual “Filling up shuffle buffer …” pause.
+
+        Args
+        ----
+        ds    : the *un-iterated* tf.data.Dataset you’ll pass to train()
+        steps : number of iterator steps to advance; default uses
+                buffer_size // batch_size + 1 from config.
+        """
+        if steps is None:
+            steps = self.config['buffer_size'] // self.config['batch_size'] + 1
+
+        it = iter(ds)
+        for _ in range(steps):
+            try:
+                next(it)
+            except StopIteration:  # dataset shorter than requested priming
+                break
 
     def fine_tune_cnn(self,
                       train_ds,
@@ -839,21 +895,168 @@ class ImageCaptioningModel:
 
         print("CNN fine-tune finished.")
 
-#--------------
+
+# In[ ]:
+
+
 processor = DataProcessor(CONFIG)
+
+
+# In[ ]:
+
+
 processor.load_captions()
+
+
+# In[ ]:
+
+
 processor.display_samples(2)
-processor.prepare_captions(subset_ratio=CONFIG['subset_ratio'])
+
+
+# In[ ]:
+
+
+processor.prepare_captions(subset_ratio=CONFIG['subset_ratio'])[:20]
+
+
+# In[ ]:
+
+
+# Create datasets
 train_ds, val_ds, _ = processor.prepare_datasets()
+
+
+# In[ ]:
+
+
+# Build and train model
 model = ImageCaptioningModel(CONFIG, processor)
 model.build_model()
+
+
+# In[ ]:
+
+
 model.summary()
+
+
+# In[ ]:
+
+
+model.prime_dataset(train_ds)
+
+
+# In[ ]:
+
+
+# Uncomment to train the model
 model.train(train_ds, processor.val_data)
-model.fine_tune_cnn(train_ds, processor.val_data, layers_to_unfreeze=2, lr=1e-5, epochs=2)
+
+
+# In[ ]:
+
+
+model.fine_tune_cnn(train_ds, processor.val_data, layers_to_unfreeze=10, lr=1e-5, epochs=2)
+
+
+# In[ ]:
+
+
 model.plot_history()
-model.evaluate_bleu(processor.test_data[:20])
-sample_img = os.path.join(CONFIG['image_dir'], processor.test_data[0][0])
+
+
+# In[ ]:
+
+
+print("Evaluating on test set:")
+model.evaluate_bleu(processor.test_data)
+
+
+# In[ ]:
+
+
+sample_pair = random.choice(processor.test_data)
+sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
 model.demo(sample_img, filename='caption_audio01.mp3')
+
+
+# In[ ]:
+
+
 sample_pair = random.choice(processor.test_data)
 sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
 model.demo(sample_img, filename='caption_audio02.mp3')
+
+
+# In[ ]:
+
+
+sample_pair = random.choice(processor.test_data)
+sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
+model.demo(sample_img, filename='caption_audio03.mp3')
+
+
+# In[ ]:
+
+
+sample_pair = random.choice(processor.test_data)
+sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
+model.demo(sample_img, filename='caption_audio04.mp3')
+
+
+# In[ ]:
+
+
+sample_pair = random.choice(processor.test_data)
+sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
+model.demo(sample_img, filename='caption_audio05.mp3')
+
+
+# In[ ]:
+
+
+# processor.display_samples(10)
+
+
+# In[ ]:
+
+
+# # -------- 1-image over-fit check ---------------------------------
+# one_pair   = [processor.train_data[0]]          # (img, caption)
+# one_ds     = processor.build_dataset(one_pair,
+#                                      shuffle=False, cache=False
+#                                     ).repeat()  # infinite
+
+# OVF_CFG = CONFIG.copy()
+# OVF_CFG.update({
+#     'epochs'       : 1,       # we’ll drive the loop ourselves
+#     'batch_size'   : 1,
+#     'checkpoint_dir': './checkpoints/onefit'
+# })
+
+# one_model = ImageCaptioningModel(OVF_CFG, processor)
+# one_model.build_model()
+
+# def show_image(path, title=''):
+#     img = Image.open(path)
+#     plt.figure(figsize=(6, 4))
+#     plt.imshow(img)
+#     plt.axis('off')
+#     if title: plt.title(title)
+#     plt.show()
+
+# img_path = os.path.join(OVF_CFG['image_dir'], one_pair[0][0])
+# show_image(img_path, 'Single-image over-fit target')
+
+# # run ~1 000 gradient steps
+# steps = 1000
+# for step, (img_t, tgt, cap_len) in zip(range(steps), one_ds):
+#     loss = one_model.train_step(img_t, tgt, cap_len)
+#     if (step+1) % 100 == 0:
+#         print(f"step {step+1}: loss={loss.numpy():.3f}")
+#         print("→", " ".join(one_model.greedy_decode(img_path)))
+
+# print("\nFinal caption:")
+# print(" ".join(one_model.greedy_decode(img_path)))
+
