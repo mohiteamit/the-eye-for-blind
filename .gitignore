@@ -3,6 +3,7 @@ data/*
 Eye-for-blind-prompt.md
 Eye-for-blind-prompt2.md
 Untitled*.py
+checkpoints/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
