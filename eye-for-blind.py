@@ -293,27 +293,66 @@ class BahdanauAttention(layers.Layer):
         return context_vector, tf.squeeze(attention_weights, -1)
 
 class Decoder(Model):
-    def __init__(self, embedding_dim, units, vocab_size):
+    """
+    “Show, Attend and Tell”-style soft-attention decoder
+    ----------------------------------------------------
+    Implements the formulation from Xu et al. (2015) including βₜ
+    (a learnable scalar gate that modulates the context vector).
+    """
+    def __init__(self, embedding_dim: int, units: int, vocab_size: int):
         super().__init__(name="decoder")
         self.units = units
-        self.embedding = layers.Embedding(vocab_size, embedding_dim)
-        self.lstm = layers.LSTM(units, return_sequences=True, return_state=True)
-        self.fc = layers.Dense(vocab_size)
-        self.attention = BahdanauAttention(units)
-        self.dropout = layers.Dropout(0.3)
-    
-    def call(self, x, features, hidden, cell):
-        context, attn = self.attention(features, hidden)
-        x = self.embedding(x)
-        x = tf.concat([tf.expand_dims(context, 1), x], axis=-1)
-        
-        hidden = tf.cast(hidden, x.dtype)
-        cell = tf.cast(cell, x.dtype)
 
-        output, state_h, state_c = self.lstm(x, initial_state=[hidden, cell])
-        output = self.dropout(output)
-        logits = self.fc(output)
-        return logits, state_h, state_c, attn
+        # Layers
+        self.embedding   = layers.Embedding(vocab_size, embedding_dim)
+        self.attention   = BahdanauAttention(units)
+        self.f_beta      = layers.Dense(1, activation="sigmoid")   # gate βₜ
+        self.lstm        = layers.LSTM(
+            units,
+            return_sequences=True,
+            return_state=True)
+        self.dropout     = layers.Dropout(0.3)
+
+        # Deep-output layer (cf. paper, Eq. (9))
+        self.fc          = layers.Dense(vocab_size)                # W_p
+
+    def call(
+        self,
+        x: tf.Tensor,                 # (batch, 1)   previous word ids
+        features: tf.Tensor,          # (batch, L, 2048) image annotations
+        hidden: tf.Tensor,            # (batch, units)
+        cell: tf.Tensor               # (batch, units)
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        # 1) Attention using h_{t-1}
+        context, alpha = self.attention(features, hidden)          # (batch, 2048), (batch, L)
+
+        # 2) Gating scalar βₜ  — “how much to attend”
+        beta    = self.f_beta(hidden)                              # (batch, 1)
+        context = beta * context                                   # (batch, 2048)
+
+        # 3) Word embedding
+        x = self.embedding(x)                                      # (batch, 1, embed_dim)
+
+        # 4) Concatenate context → input to LSTM
+        lstm_input = tf.concat([tf.expand_dims(context, 1), x], -1)  # (batch, 1, 2048+embed)
+
+        # 5) Re-cast (mixed-precision safety)
+        hidden = tf.cast(hidden, lstm_input.dtype)
+        cell   = tf.cast(cell,   lstm_input.dtype)
+
+        # 6) Recurrent update
+        lstm_out, h_t, c_t = self.lstm(lstm_input, initial_state=[hidden, cell])  # (batch,1,units)
+
+        # 7) Deep-output layer  (paper: maxout; we use tanh+linear for simplicity)
+        lstm_out = tf.squeeze(lstm_out, 1)                         # (batch, units)
+        deep_out = tf.concat([lstm_out, context], -1)              # (batch, units+2048)
+        deep_out = self.dropout(deep_out)
+        logits   = self.fc(deep_out)                               # (batch, vocab)
+
+        # Keep time-axis for compatibility with outer code
+        logits = tf.expand_dims(logits, 1)                         # (batch, 1, vocab)
+
+        return logits, h_t, c_t, alpha
 
 class ImageCaptioningModel:
     def __init__(self, config, processor):
@@ -393,49 +432,78 @@ class ImageCaptioningModel:
 
 
     @tf.function
-    def train_step(self, img_tensor, target, cap_len):
-        """Execute a single training step."""
-        # Ensure models are built
+    def train_step(self,
+                   img_tensor: tf.Tensor,
+                   target:     tf.Tensor,
+                   cap_len:    tf.Tensor) -> tf.Tensor:
+        """
+        Single training step with *doubly-stochastic* attention
+        regularisation from “Show, Attend and Tell”.
+        """
         if self.encoder is None or self.decoder is None:
             raise ValueError("Models not built. Call build_model() first.")
-        
-        loss = 0.0
+
         batch_size = tf.shape(img_tensor)[0]
-        hidden = tf.zeros((batch_size, self.config['units']))
-        cell = tf.zeros_like(hidden)
-        dec_input = tf.expand_dims(
-            tf.repeat(self.processor.tokenizer.word_index['<start>'], batch_size), 1
-        )
-        
+        hidden     = tf.zeros((batch_size, self.config['units']))
+        cell       = tf.zeros_like(hidden)
+
+        # <start> token
+        start_tok  = self.processor.tokenizer.word_index['<start>']
+        dec_input  = tf.expand_dims(tf.repeat(start_tok, batch_size), 1)
+
+        attention_accum = None   # to store Σ_t α_{t,i}
+        total_loss      = 0.0
+
         with tf.GradientTape() as tape:
-            features = self.encoder(img_tensor)
+            features = self.encoder(img_tensor)                    # (B, L, 2048)
+
+            # iterate over caption timesteps
             for t in range(1, self.config['max_length']):
-                logits, hidden, cell, _ = self.decoder(dec_input, features, hidden, cell)
-                loss_ = self.loss_fn(target[:, t], tf.squeeze(logits, 1))
-                mask = tf.cast(target[:, t] > 0, tf.float32)
-                loss += tf.reduce_sum(tf.cast(loss_, tf.float32) * mask)
+                logits, hidden, cell, alpha = self.decoder(
+                    dec_input, features, hidden, cell)
+
+                # accumulate attention weights for regularisation
+                if attention_accum is None:
+                    attention_accum = alpha
+                else:
+                    attention_accum += alpha                       # element-wise Σ_t α_{t,i}
+
+                # standard X-entropy loss
+                loss_t = self.loss_fn(target[:, t],
+                                      tf.squeeze(logits, 1))       # (B,)
+                mask   = tf.cast(target[:, t] > 0, tf.float32)
+                total_loss += tf.reduce_sum(loss_t * mask)
+
+                # teacher forcing
                 dec_input = tf.expand_dims(target[:, t], 1)
-            
-            # Average loss per token
-            total_loss = loss / tf.reduce_sum(tf.cast(cap_len, tf.float32))
-            
-            # Handle mixed precision - scale loss for gradient computation
-            if CONFIG['mixed_precision']:
-                total_loss = tf.cast(total_loss, tf.float32)
-        
-        # Get trainable variables and apply gradients
-        variables = self.encoder.trainable_variables + self.decoder.trainable_variables
-        gradients = tape.gradient(total_loss, variables)
-        
-        # Handle mixed precision - cast gradients to float32 if needed
+
+            # normalise by number of real tokens
+            total_tokens = tf.reduce_sum(tf.cast(cap_len, tf.float32))
+            ce_loss      = total_loss / total_tokens
+
+            # ---- doubly-stochastic attention regulariser (Eq. (14)) ----
+            lambda_reg   = self.config.get('attention_reg_lambda', 1.0)
+            # Σ_i (1 − Σ_t α_{t,i})²  averaged over batch
+            reg_loss = tf.reduce_mean(tf.square(1.0 - attention_accum))
+            loss     = ce_loss + lambda_reg * reg_loss
+
+            # mixed-precision safety
+            if self.config['mixed_precision']:
+                loss = tf.cast(loss, tf.float32)
+
+        # gradients & update
+        variables  = self.encoder.trainable_variables + self.decoder.trainable_variables
+        grads      = tape.gradient(loss, variables)
+
         if self.config['mixed_precision']:
-            gradients = [tf.cast(g, tf.float32) if g is not None else None for g in gradients]
-        
-        # Clip gradients to prevent exploding gradients
-        clipped_gradients, _ = tf.clip_by_global_norm(gradients, self.config['grad_clip_value'])
-        self.optimizer.apply_gradients(zip(clipped_gradients, variables))
-        
-        return total_loss
+            grads = [tf.cast(g, tf.float32) if g is not None else None
+                     for g in grads]
+
+        # clip to prevent exploding gradients
+        grads, _ = tf.clip_by_global_norm(grads, self.config['grad_clip_value'])
+        self.optimizer.apply_gradients(zip(grads, variables))
+
+        return loss
     
     def greedy_decode(self, image_path: str, return_attention=False):
         """Generate a caption for an image using greedy decoding."""
