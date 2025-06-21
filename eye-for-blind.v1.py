@@ -854,6 +854,82 @@ class ImageCaptioningModel:
 
         print("CNN fine-tune finished.")
 
+    def attention_diagnostics(
+        self,
+        image_path: str,
+        beam_size: int = 5,
+        length_penalty: float = 0.7,
+        k: int = 3,
+        focus_threshold: float = 0.5,
+    ):
+        """
+        On-demand visual/quantitative checks for attention quality.
+
+        • Attention shift per token           (Δαₜ  = L1 distance)
+        • Focus strength / entropy            (max αₜ, 𝓗(αₜ))
+        • Caption-token heat-maps             (re-uses plot_attention)
+        • α coverage over the image           (Σₜ αₜ)
+        • Top-k α values per token            (printed)
+
+        Args
+        ----
+        image_path       : input image
+        beam_size        : beam width for caption
+        length_penalty   : length norm for beam search
+        k                : number of top-α scores to list
+        focus_threshold  : max αₜ ≥ threshold ⇒ “strong, focused”
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        # ── generate caption & collect α’s ──────────────────────────────
+        words, alpha_list = self.beam_search_decode(
+            image_path,
+            beam_size=beam_size,
+            length_penalty=length_penalty,
+            return_attention=True,
+        )
+        alphas = np.stack(alpha_list)          # (T, L)
+        T, L = alphas.shape
+        grid = int(np.sqrt(L))                 # 8 for Inception-V3 (8 × 8)
+
+        # ── metrics ────────────────────────────────────────────────────
+        shifts     = np.concatenate([[0.0], np.sum(np.abs(np.diff(alphas, 0)), 1)])
+        entropies  = -np.sum(alphas * np.log(alphas + 1e-9), 1)
+        focused    = alphas.max(1) >= focus_threshold
+        coverage   = alphas.sum(0) / T        # mean α at each spatial cell
+
+        # ── 1) per-token heat-maps ─────────────────────────────────────
+        self.plot_attention(image_path, words, alpha_list)
+
+        # ── 2) coverage heat-map ───────────────────────────────────────
+        plt.figure(figsize=(4, 4))
+        plt.title("α coverage")
+        plt.imshow(coverage.reshape(grid, grid), cmap="magma", origin="upper")
+        plt.axis("off")
+        plt.show()
+
+        # ── 3) shifts & entropy line-plot ──────────────────────────────
+        plt.figure(figsize=(10, 3))
+        plt.plot(shifts, label="Δα (shift)")
+        plt.plot(entropies, label="entropy 𝓗(α)")
+        plt.xticks(range(T), words, rotation=45, ha="right")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # ── 4) top-k α values per token ────────────────────────────────
+        print(f"\nTop-{k} α values per token:")
+        for w, a in zip(words, alphas):
+            topk = np.sort(a)[-k:][::-1]
+            print(f"{w:<15} {topk}")
+
+        # ── 5) highlight strong, focused tokens ────────────────────────
+        print(f"\nTokens with strong focus (max α ≥ {focus_threshold:.2f}):")
+        for i, (w, flag) in enumerate(zip(words, focused)):
+            if flag:
+                print(f"  {i:02d} – {w}")
+                
 processor = DataProcessor(CONFIG)
 _ = processor.load_captions()
 processor.display_samples(2)
