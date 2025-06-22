@@ -1,6 +1,6 @@
-
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 import re
 import time
 import random
@@ -39,7 +39,7 @@ CONFIG = {
     'seed': 42,
     'epochs': 20,                # Slightly more for small dataset
     'patience': 8,               # Early stopping tolerance
-    'learning_rate': 3e-4,       # Lower for small datasets to reduce overfitting
+    'learning_rate': 1e-4,       # Lower for small datasets to reduce overfitting
     'grad_clip_value': 5.0,      # Prevent exploding gradients
     'scheduled_sampling_max_prob' : 0.25,    # final ε
     
@@ -76,6 +76,7 @@ else:
     print("No GPUs found, using CPU")
     strategy = tf.distribute.get_strategy()
 
+# Constants
 AUTOTUNE = tf.data.AUTOTUNE
 
 class DataProcessor:
@@ -307,10 +308,6 @@ class Encoder(Model):
         x = self.cnn(x)                                            # (B,8,8,2048)
         return self.reshape(x)                                     # (B,64,2048)
 
-
-# In[ ]:
-
-
 class BahdanauAttention(layers.Layer):
     def __init__(self, units):
         super().__init__(name="attention")
@@ -324,10 +321,6 @@ class BahdanauAttention(layers.Layer):
         attention_weights = tf.nn.softmax(score, axis=1)
         context_vector = tf.reduce_sum(attention_weights * features, axis=1)
         return context_vector, tf.squeeze(attention_weights, -1)
-
-
-# In[ ]:
-
 
 class Decoder(Model):
     """
@@ -343,7 +336,7 @@ class Decoder(Model):
         self.attention = BahdanauAttention(units)
         self.f_beta    = layers.Dense(1, activation="sigmoid")          # βₜ
         self.lstm      = layers.LSTM(units, return_sequences=True, return_state=True)
-        self.dropout   = layers.Dropout(0.3)
+        self.dropout   = layers.Dropout(0.5)
 
         # max-out projection: 2 × units → reduce_max → units
         self.deep_proj = layers.Dense(units * 2)                        # W_o
@@ -370,10 +363,6 @@ class Decoder(Model):
 
         logits = self.fc(maxout)                                         # (B,vocab)
         return tf.expand_dims(logits, 1), h_t, c_t, alpha
-
-
-# In[ ]:
-
 
 class ImageCaptioningModel:
     def __init__(self, config, processor):
@@ -854,174 +843,24 @@ class ImageCaptioningModel:
 
         print("CNN fine-tune finished.")
 
-
-# In[ ]:
-
-
 processor = DataProcessor(CONFIG)
-
-
-# In[ ]:
-
-
 _ = processor.load_captions()
-
-
-# In[ ]:
-
-
 processor.display_samples(2)
-
-
-# In[ ]:
-
-
 processor.prepare_captions(subset_ratio=CONFIG['subset_ratio'])[:20]
-
-
-# In[ ]:
-
-
-# Create datasets
 train_ds, val_ds, _ = processor.prepare_datasets()
-
-
-# In[ ]:
-
-
-# Build and train model
 model = ImageCaptioningModel(CONFIG, processor)
 model.build_model()
-
-
-# In[ ]:
-
-
 model.summary()
-
-
-# In[ ]:
-
-
 model.prime_dataset(train_ds, steps=20)
-
-
-# In[ ]:
-
-
 reduced_val = random.sample(processor.val_data, 1000)
-
-
-# In[ ]:
-
-
 # model.train(train_ds, processor.val_data)
 model.train(train_ds, reduced_val)
-
-
-# In[ ]:
-
-
 model.fine_tune_cnn(train_ds, processor.val_data, layers_to_unfreeze=8, lr=1e-5, epochs=5)
-
-
-# In[ ]:
-
-
 model.plot_history()
-
-
-# In[ ]:
-
-
-print("Evaluating on test set:")
 model.evaluate_bleu(processor.test_data)
-
-
-# In[ ]:
-
-
 sample_pair = random.choice(processor.test_data)
 sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
 model.demo(sample_img, filename='caption_audio01.mp3')
-
-
-# In[ ]:
-
-
 sample_pair = random.choice(processor.test_data)
 sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
 model.demo(sample_img, filename='caption_audio02.mp3')
-
-
-# In[ ]:
-
-
-sample_pair = random.choice(processor.test_data)
-sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
-model.demo(sample_img, filename='caption_audio03.mp3')
-
-
-# In[ ]:
-
-
-sample_pair = random.choice(processor.test_data)
-sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
-model.demo(sample_img, filename='caption_audio04.mp3')
-
-
-# In[ ]:
-
-
-sample_pair = random.choice(processor.test_data)
-sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
-model.demo(sample_img, filename='caption_audio05.mp3')
-
-
-# In[ ]:
-
-
-# processor.display_samples(10)
-
-
-# In[ ]:
-
-
-# # -------- 1-image over-fit check ---------------------------------
-# one_pair   = [processor.train_data[0]]          # (img, caption)
-# one_ds     = processor.build_dataset(one_pair,
-#                                      shuffle=False, cache=False
-#                                     ).repeat()  # infinite
-
-# OVF_CFG = CONFIG.copy()
-# OVF_CFG.update({
-#     'epochs'       : 1,       # we’ll drive the loop ourselves
-#     'batch_size'   : 1,
-#     'checkpoint_dir': './checkpoints/onefit'
-# })
-
-# one_model = ImageCaptioningModel(OVF_CFG, processor)
-# one_model.build_model()
-
-# def show_image(path, title=''):
-#     img = Image.open(path)
-#     plt.figure(figsize=(6, 4))
-#     plt.imshow(img)
-#     plt.axis('off')
-#     if title: plt.title(title)
-#     plt.show()
-
-# img_path = os.path.join(OVF_CFG['image_dir'], one_pair[0][0])
-# show_image(img_path, 'Single-image over-fit target')
-
-# # run ~1 000 gradient steps
-# steps = 1000
-# for step, (img_t, tgt, cap_len) in zip(range(steps), one_ds):
-#     loss = one_model.train_step(img_t, tgt, cap_len)
-#     if (step+1) % 100 == 0:
-#         print(f"step {step+1}: loss={loss.numpy():.3f}")
-#         print("→", " ".join(one_model.greedy_decode(img_path)))
-
-# print("\nFinal caption:")
-# print(" ".join(one_model.greedy_decode(img_path)))
-
