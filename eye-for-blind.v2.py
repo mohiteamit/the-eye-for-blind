@@ -1,6 +1,6 @@
-
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 import re
 import time
 import random
@@ -25,16 +25,16 @@ CONFIG = {
     'subset_ratio' : 1.0,
     'image_dir': '/home/flickr30k_images/flickr30k_images',
     'caption_file': '/home/flickr30k_images/flickr30k_images/results.csv',
-    
+
     # GPU Utilization
     'batch_size': 128,           # Fully utilize 48GB VRAM; reduce if OOM
     'buffer_size': 10000,        # Larger shuffle buffer helps training stability
-    
+
     # Model Capacity
     'max_length': 30,            # Reasonable for captions
     'embedding_dim': 512,        # Good for attention + LSTM
     'units': 512,                # LSTM/Attention size
-    
+
     # Training Behavior
     'seed': 42,
     'epochs': 20,                # Slightly more for small dataset
@@ -42,10 +42,10 @@ CONFIG = {
     'learning_rate': 3e-4,       # Lower for small datasets to reduce overfitting
     'grad_clip_value': 5.0,      # Prevent exploding gradients
     'scheduled_sampling_max_prob' : 0.25,    # final ε
-    
+
     # Vocabulary
     'vocab_min_count': 3,        # Include more words for small run
-    
+
     # Output & Precision
     'checkpoint_dir': './checkpoints/10pct',
     'mixed_precision': False,     # RTX 6000 Ada has 4th-gen Tensor Cores—use them
@@ -68,7 +68,7 @@ if physical_devices:
     # Enable memory growth for RTX 6000 Ada
     for gpu in physical_devices:
         tf.config.experimental.set_memory_growth(gpu, True)
-    
+
     # Use default strategy for single GPU
     strategy = tf.distribute.get_strategy()
     print(f"Using single GPU: {physical_devices[0].name}, batch size={CONFIG['batch_size']}")
@@ -76,6 +76,7 @@ else:
     print("No GPUs found, using CPU")
     strategy = tf.distribute.get_strategy()
 
+# Constants
 AUTOTUNE = tf.data.AUTOTUNE
 
 class DataProcessor:
@@ -87,7 +88,7 @@ class DataProcessor:
         self.train_data = []
         self.val_data = []
         self.test_data = []
-    
+
     def load_captions(self) -> Dict[str, List[str]]:
         """Load and convert pipe-delimited Flickr-style caption file to a dict."""
         print(f"Loading captions from {self.config['caption_file']}")
@@ -95,15 +96,15 @@ class DataProcessor:
                          names=['image_name', 'comment_number', 'comment'], engine='python')
         df['image_name'] = df['image_name'].str.strip()
         df['comment'] = df['comment'].str.strip()
-        
+
         caption_map = {}
         for img, group in df.groupby('image_name'):
             caption_map[img] = group['comment'].tolist()
-        
+
         self.captions_dict = caption_map
         print(f"Loaded {len(caption_map)} images with captions")
         return caption_map
-    
+
     def display_samples(self, num_samples: int = 3):
         """Display random images with all their associated captions."""
         if not self.captions_dict:
@@ -191,12 +192,12 @@ class DataProcessor:
         print(f"split  →  train {len(self.train_data)} | val {len(self.val_data)} | test {len(self.test_data)}")
 
         return filtered
-        
+
     def encode_caption(self, caption: str) -> Tuple[np.ndarray, int]:
         """Convert caption text to sequence of token ids."""
         if self.tokenizer is None:
             raise ValueError("Tokenizer not initialized. Call prepare_captions first.")
-        
+
         seq = self.tokenizer.texts_to_sequences([caption])[0]
         padded_seq = pad_sequences([seq], maxlen=self.config['max_length'], padding='post')[0]
         return padded_seq, len(seq)
@@ -246,7 +247,7 @@ class DataProcessor:
             img_tensor = self.load_image_train(tf.convert_to_tensor(img_path))
             token_ids, cap_len = self.encode_caption(cap)
             yield img_tensor, token_ids, cap_len
-    
+
     def build_dataset(self, data, shuffle=True, cache=True, training: bool=True):
         """Create a tf.data.Dataset optimized for single GPU."""
         output_signature = (
@@ -278,7 +279,7 @@ class DataProcessor:
         train_ds = self.build_dataset(self.train_data)
         val_ds = self.build_dataset(self.val_data)
         test_ds = self.build_dataset(self.test_data, shuffle=False)
-        
+
         return train_ds, val_ds, test_ds
 
 class Encoder(Model):
@@ -307,27 +308,19 @@ class Encoder(Model):
         x = self.cnn(x)                                            # (B,8,8,2048)
         return self.reshape(x)                                     # (B,64,2048)
 
-
-# In[ ]:
-
-
 class BahdanauAttention(layers.Layer):
     def __init__(self, units):
         super().__init__(name="attention")
         self.W1 = layers.Dense(units)
         self.W2 = layers.Dense(units)
         self.V = layers.Dense(1)
-    
+
     def call(self, features, hidden):
         hidden_time = tf.expand_dims(hidden, 1)
         score = self.V(tf.nn.tanh(self.W1(features) + self.W2(hidden_time)))
         attention_weights = tf.nn.softmax(score, axis=1)
         context_vector = tf.reduce_sum(attention_weights * features, axis=1)
         return context_vector, tf.squeeze(attention_weights, -1)
-
-
-# In[ ]:
-
 
 class Decoder(Model):
     """
@@ -371,10 +364,6 @@ class Decoder(Model):
         logits = self.fc(maxout)                                         # (B,vocab)
         return tf.expand_dims(logits, 1), h_t, c_t, alpha
 
-
-# In[ ]:
-
-
 class ImageCaptioningModel:
     def __init__(self, config, processor):
         self.config          = config
@@ -392,7 +381,7 @@ class ImageCaptioningModel:
         self.bleu_subset_idx = None  
 
         self.smoothie = SmoothingFunction().method4
-    
+
     def build_model(self):
         """Build model for single GPU - no distribution strategy needed."""
         print("Building model for single GPU...")
@@ -402,14 +391,14 @@ class ImageCaptioningModel:
             units=self.config['units'], 
             vocab_size=self.processor.vocab_size
         )
-        
+
         lr_schedule = CosineDecay(
             initial_learning_rate=self.config['learning_rate'],
             decay_steps=10000
         )
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
         self.loss_fn = SparseCategoricalCrossentropy(from_logits=True, reduction='none')
-        
+
         # Set up checkpointing
         ckpt_dir = self.config['checkpoint_dir']
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -419,12 +408,12 @@ class ImageCaptioningModel:
             optimizer=self.optimizer
         )
         self.ckpt_manager = tf.train.CheckpointManager(ckpt, ckpt_dir, max_to_keep=3)
-        
+
         # Try to restore the latest checkpoint
         if self.ckpt_manager.latest_checkpoint:
             ckpt.restore(self.ckpt_manager.latest_checkpoint)
             print(f"Restored from checkpoint: {self.ckpt_manager.latest_checkpoint}")
-    
+
     def summary(self):
         """Print model summaries for Encoder, Attention, and Decoder."""
         print("Building model summaries...")
@@ -613,18 +602,18 @@ class ImageCaptioningModel:
         """Calculate BLEU scores on test data."""
         refs, hyps = [], []
         data_to_eval = test_data[:max_samples] if max_samples else test_data
-        
+
         for img_name, _ in tqdm.tqdm(data_to_eval):
             image_path = os.path.join(self.config['image_dir'], img_name)
             hyp = self.greedy_decode(image_path)
-            
+
             # Process ground truth captions
             gt = [self.processor.preprocess_caption(c).split() for c in self.processor.captions_dict[img_name][:5]]
             gt = [[w for w in cap if w not in ('<start>', '<end>')] for cap in gt]
-            
+
             refs.append(gt)
             hyps.append(hyp)
-        
+
         # Calculate BLEU scores for different n-grams
         bleu_scores = {}
         for i in range(1, 5):
@@ -632,9 +621,9 @@ class ImageCaptioningModel:
             score = corpus_bleu(refs, hyps, weights=weights, smoothing_function=self.smoothie)
             bleu_scores[f'bleu-{i}'] = score
             print(f"BLEU-{i}: {score:.4f}")
-        
+
         return bleu_scores
-    
+
     def train(self, train_ds, val_data, epochs=None, subset_size: int = 200):
         """
         Train with:
@@ -702,26 +691,26 @@ class ImageCaptioningModel:
                   f"time={time.time()-start:.1f}s", flush=True)
 
         return self.train_loss_log, self.val_bleu_log
-    
+
     def plot_attention(self, image_path: str, caption: list, alphas: list):
         """Visualize attention weights overlaid on the source image."""
         img = np.array(Image.open(image_path).resize((224, 224)))
         fig = plt.figure(figsize=(15, 8))
-        
+
         for t in range(len(caption)):
             ax = fig.add_subplot(3, int(np.ceil(len(caption)/3)), t+1)
             ax.set_title(caption[t])
             ax.imshow(img)
-            
+
             alpha = np.array(alphas[t])
             attention_shape = int(np.sqrt(alpha.size))
             alpha = alpha.reshape(attention_shape, attention_shape)
             ax.imshow(alpha, cmap='viridis', alpha=0.6, extent=(0, 224, 224, 0))
             ax.axis('off')
-            
+
         plt.tight_layout()
         plt.show()
-    
+
     def plot_history(self):
         """Plot loss curve **and** both train/val BLEU-4 curves."""
         plt.figure(figsize=(14, 5))
@@ -748,18 +737,18 @@ class ImageCaptioningModel:
 
         plt.tight_layout()
         plt.show()
-    
+
     def speak_caption(self, caption: str, filename="caption_audio.mp3"):
         """Generate speech audio from caption text."""
         if not caption:
             print("Empty caption, nothing to speak")
             return
-            
+
         tts = gTTS(text=caption, lang='en')
         tts.save(filename)
         display(Audio(filename))
         print(f"Audio saved to {filename}")
-    
+
     def demo(self,
              image_path: str,
              filename: str = "caption_audio.mp3",
@@ -811,7 +800,6 @@ class ImageCaptioningModel:
         # ---------- 5. attention plot ----------
         self.plot_attention(image_path, words, attention)
 
-
     def prime_dataset(self, ds, steps: int = None) -> None:
         """
         Pre-fill a tf.data shuffle buffer so the first training epoch
@@ -854,174 +842,96 @@ class ImageCaptioningModel:
 
         print("CNN fine-tune finished.")
 
+    def attention_diagnostics(
+        self,
+        image_path: str,
+        beam_size: int = 5,
+        length_penalty: float = 0.7,
+        k: int = 3,
+        focus_threshold: float = 0.5,
+    ):
+        """
+        On-demand visual/quantitative checks for attention quality.
 
-# In[ ]:
+        • Attention shift per token           (Δαₜ  = L1 distance)
+        • Focus strength / entropy            (max αₜ, 𝓗(αₜ))
+        • Caption-token heat-maps             (re-uses plot_attention)
+        • α coverage over the image           (Σₜ αₜ)
+        • Top-k α values per token            (printed)
 
+        Args
+        ----
+        image_path       : input image
+        beam_size        : beam width for caption
+        length_penalty   : length norm for beam search
+        k                : number of top-α scores to list
+        focus_threshold  : max αₜ ≥ threshold ⇒ “strong, focused”
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        # ── generate caption & collect α’s ──────────────────────────────
+        words, alpha_list = self.beam_search_decode(
+            image_path,
+            beam_size=beam_size,
+            length_penalty=length_penalty,
+            return_attention=True,
+        )
+        alphas = np.stack(alpha_list)          # (T, L)
+        T, L = alphas.shape
+        grid = int(np.sqrt(L))                 # 8 for Inception-V3 (8 × 8)
+
+        # ── metrics ────────────────────────────────────────────────────
+        shifts     = np.concatenate([[0.0], np.sum(np.abs(np.diff(alphas, 0)), 1)])
+        entropies  = -np.sum(alphas * np.log(alphas + 1e-9), 1)
+        focused    = alphas.max(1) >= focus_threshold
+        coverage   = alphas.sum(0) / T        # mean α at each spatial cell
+
+        # ── 1) per-token heat-maps ─────────────────────────────────────
+        self.plot_attention(image_path, words, alpha_list)
+
+        # ── 2) coverage heat-map ───────────────────────────────────────
+        plt.figure(figsize=(4, 4))
+        plt.title("α coverage")
+        plt.imshow(coverage.reshape(grid, grid), cmap="magma", origin="upper")
+        plt.axis("off")
+        plt.show()
+
+        # ── 3) shifts & entropy line-plot ──────────────────────────────
+        plt.figure(figsize=(10, 3))
+        plt.plot(shifts, label="Δα (shift)")
+        plt.plot(entropies, label="entropy 𝓗(α)")
+        plt.xticks(range(T), words, rotation=45, ha="right")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # ── 4) top-k α values per token ────────────────────────────────
+        print(f"\nTop-{k} α values per token:")
+        for w, a in zip(words, alphas):
+            topk = np.sort(a)[-k:][::-1]
+            print(f"{w:<15} {topk}")
+
+        # ── 5) highlight strong, focused tokens ────────────────────────
+        print(f"\nTokens with strong focus (max α ≥ {focus_threshold:.2f}):")
+        for i, (w, flag) in enumerate(zip(words, focused)):
+            if flag:
+                print(f"  {i:02d} – {w}")
 
 processor = DataProcessor(CONFIG)
-
-
-# In[ ]:
-
-
 _ = processor.load_captions()
-
-
-# In[ ]:
-
-
 processor.display_samples(2)
-
-
-# In[ ]:
-
-
 processor.prepare_captions(subset_ratio=CONFIG['subset_ratio'])[:20]
-
-
-# In[ ]:
-
-
-# Create datasets
 train_ds, val_ds, _ = processor.prepare_datasets()
-
-
-# In[ ]:
-
-
-# Build and train model
 model = ImageCaptioningModel(CONFIG, processor)
 model.build_model()
-
-
-# In[ ]:
-
-
 model.summary()
-
-
-# In[ ]:
-
-
 model.prime_dataset(train_ds, steps=20)
-
-
-# In[ ]:
-
-
 reduced_val = random.sample(processor.val_data, 1000)
-
-
-# In[ ]:
-
-
-# model.train(train_ds, processor.val_data)
 model.train(train_ds, reduced_val)
-
-
-# In[ ]:
-
-
 model.fine_tune_cnn(train_ds, processor.val_data, layers_to_unfreeze=8, lr=1e-5, epochs=5)
-
-
-# In[ ]:
-
-
 model.plot_history()
-
-
-# In[ ]:
-
-
-print("Evaluating on test set:")
 model.evaluate_bleu(processor.test_data)
-
-
-# In[ ]:
-
-
 sample_pair = random.choice(processor.test_data)
 sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
 model.demo(sample_img, filename='caption_audio01.mp3')
-
-
-# In[ ]:
-
-
-sample_pair = random.choice(processor.test_data)
-sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
-model.demo(sample_img, filename='caption_audio02.mp3')
-
-
-# In[ ]:
-
-
-sample_pair = random.choice(processor.test_data)
-sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
-model.demo(sample_img, filename='caption_audio03.mp3')
-
-
-# In[ ]:
-
-
-sample_pair = random.choice(processor.test_data)
-sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
-model.demo(sample_img, filename='caption_audio04.mp3')
-
-
-# In[ ]:
-
-
-sample_pair = random.choice(processor.test_data)
-sample_img = os.path.join(CONFIG['image_dir'], sample_pair[0])
-model.demo(sample_img, filename='caption_audio05.mp3')
-
-
-# In[ ]:
-
-
-# processor.display_samples(10)
-
-
-# In[ ]:
-
-
-# # -------- 1-image over-fit check ---------------------------------
-# one_pair   = [processor.train_data[0]]          # (img, caption)
-# one_ds     = processor.build_dataset(one_pair,
-#                                      shuffle=False, cache=False
-#                                     ).repeat()  # infinite
-
-# OVF_CFG = CONFIG.copy()
-# OVF_CFG.update({
-#     'epochs'       : 1,       # we’ll drive the loop ourselves
-#     'batch_size'   : 1,
-#     'checkpoint_dir': './checkpoints/onefit'
-# })
-
-# one_model = ImageCaptioningModel(OVF_CFG, processor)
-# one_model.build_model()
-
-# def show_image(path, title=''):
-#     img = Image.open(path)
-#     plt.figure(figsize=(6, 4))
-#     plt.imshow(img)
-#     plt.axis('off')
-#     if title: plt.title(title)
-#     plt.show()
-
-# img_path = os.path.join(OVF_CFG['image_dir'], one_pair[0][0])
-# show_image(img_path, 'Single-image over-fit target')
-
-# # run ~1 000 gradient steps
-# steps = 1000
-# for step, (img_t, tgt, cap_len) in zip(range(steps), one_ds):
-#     loss = one_model.train_step(img_t, tgt, cap_len)
-#     if (step+1) % 100 == 0:
-#         print(f"step {step+1}: loss={loss.numpy():.3f}")
-#         print("→", " ".join(one_model.greedy_decode(img_path)))
-
-# print("\nFinal caption:")
-# print(" ".join(one_model.greedy_decode(img_path)))
-
