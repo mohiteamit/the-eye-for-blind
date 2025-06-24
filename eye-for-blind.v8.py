@@ -1,9 +1,5 @@
-# ──────────────────────────────────────────────────────────────────────────────
-#  EYE FOR BLIND – “SHOW, ATTEND & TELL” - FULL REWRITE (review v2025-06-24)
-#  All 14 checklist items from the code-review are implemented below.
-#  Paste this single cell into your notebook and run from the top.
-# ──────────────────────────────────────────────────────────────────────────────
 import os, re, time, math, random, json, pickle, itertools, warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 from collections import Counter, deque
 from typing import Dict, List, Tuple, Optional
 
@@ -19,17 +15,20 @@ from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. GLOBAL CONFIG – now covers every checklist flag in one place
-# ──────────────────────────────────────────────────────────────────────────────
+
+# # 1. CONFIG
+
+# In[ ]:
+
+
 CONFIG: Dict[str, object] = {
     # Data
-    'image_dir'            : '/home/flickr30k_images/flickr30k_images',
-    'caption_file'         : '/home/flickr30k_images/flickr30k_images/results.csv',
+    'image_dir'            : '/home/flickr8k/Images',
+    'caption_file'         : '/home/flickr8k/captions_8k.csv',
     'subset_ratio'         : 1.0,
     # Vocabulary & sequence
-    'vocab_min_count'      : 2,          # [spec 1] ↓ from 5
-    'top_k'                : 10_000,     # [spec 1] explicit cap
+    'vocab_min_count'      : 1,         # [spec 1] reduced from 5
+    'top_k'                : 9_000,     # [spec 1] explicit cap
     'max_length'           : 30,
     # Model
     'embedding_dim'        : 512,
@@ -37,11 +36,11 @@ CONFIG: Dict[str, object] = {
     'decoder_dropout'      : 0.3,
     'attention_reg_lambda' : 0.1,        # [spec 5]  coverage regulariser
     # Training
-    'epochs'               : 30,
+    'epochs'               : 50,
     'batch_size'           : 128,
     'buffer_size'          : 10_000,
     'scheduled_sampling_max_prob': 0.4,  # [spec 4]  ↑ from 0.15
-    'mixed_precision'      : True,
+    'mixed_precision'      : False,
     'grad_clip_value'      : 10.0,
     'early_stop'           : True,
     'patience'             : 20,
@@ -49,16 +48,20 @@ CONFIG: Dict[str, object] = {
     'initial_lr'           : 5e-4,
     'lr_alpha'             : 1e-2,
     # Checkpoints
-    'checkpoint_dir'       : './checkpoints/split_by_image',
+    'checkpoint_dir'       : './checkpoints/chk-v8',
     'save_checkpoints'     : True,
     'delete_old_checkpoints': True,
     # Misc / reproducibility
     'seed'                 : 42,
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. DETERMINISTIC INITIALISATION
-# ──────────────────────────────────────────────────────────────────────────────
+
+# # 2. ENV‑SETUP & MIXED‑PRECISION POLICY
+# 
+
+# In[ ]:
+
+
 np.random.seed(CONFIG['seed'])
 random.seed(CONFIG['seed'])
 tf.random.set_seed(CONFIG['seed'])
@@ -66,7 +69,7 @@ warnings.filterwarnings("ignore")
 
 if CONFIG['mixed_precision']:
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
-    print("[AMP] mixed_float16 policy active ✨")
+    print("[AMP] mixed_float16 policy active")
 
 # single-GPU safe-growth
 for gpu in tf.config.list_physical_devices('GPU'):
@@ -75,9 +78,12 @@ print("Device list:", tf.config.list_logical_devices('GPU'))
 
 AUTOTUNE = tf.data.AUTOTUNE
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. DATA PROCESSOR  – handles tokeniser & tf.data pipelines
-# ──────────────────────────────────────────────────────────────────────────────
+
+# # 3. DATA PROCESSING
+
+# In[ ]:
+
+
 class DataProcessor:
     def __init__(self, cfg):
         self.cfg      = cfg
@@ -92,11 +98,25 @@ class DataProcessor:
     # 3.1 load raw captions file
     # ───────────────────────────────────────────
     def load_captions(self):
+        """Read the Flickr-style caption file and build {img: [caps]} map."""
         fp = self.cfg['caption_file']
-        df = pd.read_csv(fp, sep='|', names=['img','num','cap'], engine='python')
-        df['img']  = df['img'].str.strip(); df['cap'] = df['cap'].str.strip()
-        for img,g in df.groupby('img'):
-            self.caption_map[img] = g['cap'].tolist()
+        df = pd.read_csv(fp, sep='|', engine='python', skipinitialspace=True)
+
+        # Handle both cases: header present or already stripped
+        if 'image_name' in df.columns:
+            df = df.rename(columns={
+                'image_name': 'img',
+                'comment_number': 'num',
+                'comment': 'cap'
+            })
+        else:                          # header was read as data → first row junk
+            df.columns = ['img', 'num', 'cap']
+            df = df[df['img'].str.contains(r'\.(jpg|jpeg|png)$', case=False, na=False)]
+
+        df['img'] = df['img'].str.strip()
+        df['cap'] = df['cap'].str.strip()
+
+        self.caption_map = {img: g['cap'].tolist() for img, g in df.groupby('img')}
         print(f"Loaded {len(self.caption_map):,} images with captions")
 
     # ───────────────────────────────────────────
@@ -121,7 +141,7 @@ class DataProcessor:
 
         # 95-th percentile length
         self.cfg['max_length'] = int(np.percentile([len(s.split()) for s in filtered],95))
-        print("max_length →",self.cfg['max_length'])
+        print("max_length ->",self.cfg['max_length'])
 
         # tokeniser with explicit pad-idx 0  [spec 1,2]
         tok = Tokenizer(num_words=self.cfg['top_k'], oov_token='<unk>', filters='', lower=True)
@@ -182,17 +202,37 @@ class DataProcessor:
         ds=ds.batch(self.cfg['batch_size']).prefetch(AUTOTUNE)
         return ds
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. NETWORK COMPONENTS
-# ──────────────────────────────────────────────────────────────────────────────
-class Encoder(Model):
-    def __init__(self): super().__init__(); base=tf.keras.applications.InceptionV3(include_top=False,weights='imagenet',input_shape=(299,299,3))
-    def build(self,input_shape):
-        self.base=tf.keras.applications.InceptionV3(include_top=False,weights='imagenet')
-        self.base.trainable=False; self.reshape=layers.Reshape((-1,2048))
-    def call(self,x): return self.reshape(self.base(x))
-    def unfreeze_top_layers(self,n=8):                       # [spec 7]
-        for l in self.base.layers[-n:]: l.trainable=True
+
+# # 4. MODEL BUILDING BLOCKS
+
+# In[ ]:
+
+
+class Encoder(tf.keras.Model):
+    """Frozen Inception-V3 feature extractor (8×8×2048 → 64×2048)."""
+
+    def __init__(self):
+        super().__init__(name="encoder")
+        # build once – avoid re-creating variables
+        self.base = tf.keras.applications.InceptionV3(
+            include_top=False,
+            weights='imagenet',
+            input_shape=(299, 299, 3))
+        self.base.trainable = False
+        self.reshape = tf.keras.layers.Reshape((-1, 2048))  # (B,64,2048)
+
+    def call(self, x, training=False):
+        x = self.base(x, training=training)   # (B,8,8,2048)
+        return self.reshape(x)                # (B,64,2048)
+
+    def unfreeze_top_layers(self, n=8):
+        """Unfreeze last n convolutional blocks for fine-tuning."""
+        for layer in self.base.layers[-n:]:
+            layer.trainable = True
+
+
+# In[ ]:
+
 
 class BahdanauAttention(layers.Layer):
     def __init__(self,units): super().__init__(); self.W1=layers.Dense(units); self.W2=layers.Dense(units); self.V=layers.Dense(1)
@@ -201,23 +241,57 @@ class BahdanauAttention(layers.Layer):
         attn=tf.nn.softmax(score,1); ctx=tf.reduce_sum(attn*feat,1)
         return ctx,tf.squeeze(attn,-1)
 
-class Decoder(Model):
-    def __init__(self,embed_dim,units,vocab,drop):
-        super().__init__(); self.units=units
-        self.embed=layers.Embedding(vocab,embed_dim,mask_zero=True)
-        self.attn=BahdanauAttention(units); self.beta=layers.Dense(1,activation='sigmoid')
-        self.lstm=layers.LSTM(units,return_sequences=True,return_state=True)
-        self.drop=layers.Dropout(drop); self.proj=layers.Dense(units*2); self.fc=layers.Dense(vocab,dtype='float32')
-    def call(self,x,feat,h,c):
-        ctx,alpha=self.attn(feat,h); ctx=self.beta(h)*ctx
-        x=self.embed(x); x=tf.concat([tf.expand_dims(ctx,1),x],-1)
-        o,h,c=self.lstm(x,initial_state=[h,c]); o=tf.squeeze(o,1)
-        m=tf.reshape(self.proj(tf.concat([o,ctx],-1)),(-1,self.units,2)); m=tf.reduce_max(m,2)
-        return tf.expand_dims(self.drop(m),1),h,c,alpha
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. IMAGE CAPTIONING TRAINER
-# ──────────────────────────────────────────────────────────────────────────────
+# In[ ]:
+
+
+class Decoder(tf.keras.Model):
+    """Attention-based LSTM decoder – float32 throughout (stable)."""
+
+    def __init__(self, embed_dim, units, vocab_size, dropout=0.3):
+        super().__init__(name="decoder")
+        self.units = units
+        self.embed = tf.keras.layers.Embedding(vocab_size, embed_dim)
+        self.attn  = BahdanauAttention(units)
+        self.beta  = tf.keras.layers.Dense(1, activation='sigmoid')
+        self.lstm  = tf.keras.layers.LSTM(units, return_sequences=True, return_state=True)
+        self.drop  = tf.keras.layers.Dropout(dropout)
+        self.proj  = tf.keras.layers.Dense(units * 2)
+        self.fc    = tf.keras.layers.Dense(vocab_size)
+
+    def call(self, x, feat, h, c):
+        feat = tf.cast(feat, tf.float32)
+        h    = tf.cast(h,   tf.float32)
+        c    = tf.cast(c,   tf.float32)
+
+        ctx, alpha = self.attn(feat, h)
+        ctx = self.beta(h) * ctx
+        x   = self.embed(x)
+
+        lstm_in = tf.concat([tf.expand_dims(ctx, 1), x], -1)
+        o, h, c = self.lstm(lstm_in, initial_state=[h, c])
+        o = tf.squeeze(o, 1)
+
+        combined = tf.concat([o, ctx], -1)
+        proj_out = self.proj(combined)
+
+        # Ensure reshape compatibility
+        last_dim = proj_out.shape[-1]
+        if last_dim % 2 != 0:
+            proj_out = proj_out[:, :-1]  # trim last unit to make it divisible by 2
+        m = tf.reshape(proj_out, (-1, self.units, 2))
+
+        m = tf.reduce_max(m, axis=2)
+        m = self.drop(m)
+        logits = self.fc(m)
+        return tf.expand_dims(logits, 1), h, c, alpha
+
+
+# # 5. TOP‑LEVEL TRAINING WRAPPER (AMP READY)
+
+# In[ ]:
+
+
 class CaptioningSystem:
     def __init__(self,cfg:Dict[str,object],proc:DataProcessor):
         self.cfg,self.proc=cfg,proc
@@ -232,24 +306,43 @@ class CaptioningSystem:
     # ─────────────────────────────
     # 5.1 build & compile
     # ─────────────────────────────
-    def build(self,steps_per_epoch):
+    def build(self, steps_per_epoch):
         print("Building model …")
-        self.encoder=Encoder(); self.decoder=Decoder(self.cfg['embedding_dim'],self.cfg['units'],
-                                                     self.proc.vocab_size,self.cfg['decoder_dropout'])
+        self.encoder = Encoder()
+        self.decoder = Decoder(self.cfg['embedding_dim'],
+                               self.cfg['units'],
+                               self.proc.vocab_size,
+                               self.cfg['decoder_dropout'])
 
-        decay_steps=int(steps_per_epoch*self.cfg['epochs'])     # [spec 6]
-        sch=CosineDecay(self.cfg['initial_lr'],decay_steps,alpha=self.cfg['lr_alpha'])
-        base_opt=tf.keras.optimizers.Adam(sch)
-        self.opt=(tf.keras.mixed_precision.LossScaleOptimizer(base_opt)
-                  if self.cfg['mixed_precision'] else base_opt)
+        decay_steps = int(steps_per_epoch * self.cfg['epochs'])
+        schedule = tf.keras.optimizers.schedules.CosineDecay(
+            self.cfg['initial_lr'], decay_steps, alpha=self.cfg['lr_alpha'])
+        base_opt = tf.keras.optimizers.Adam(schedule)
+        self.opt = (tf.keras.mixed_precision.LossScaleOptimizer(base_opt)
+                    if self.cfg['mixed_precision'] else base_opt)
 
-        self.loss_fn=SparseCategoricalCrossentropy(from_logits=True,label_smoothing=0.1,reduction='none') # [spec 3]
+        # --- loss with fallback for TF versions lacking built-in smoothing ----
+        try:
+            self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
+                from_logits=True, label_smoothing=0.1, reduction='none')
+        except TypeError:                                            # manual LS
+            ls = 0.1
+            def _smooth_loss(y_true, logits, ls=ls):
+                vocab = tf.shape(logits)[-1]
+                y_true = tf.cast(y_true, tf.int32)
+                one = tf.one_hot(y_true, vocab, dtype=logits.dtype)  # ensure dtypes match
+                smooth = one * (1 - ls) + ls / tf.cast(vocab, logits.dtype)
+                return tf.keras.backend.categorical_crossentropy(
+                    smooth, logits, from_logits=True)
+            self.loss_fn = _smooth_loss
+        # ---------------------------------------------------------------------
 
         if self.cfg['save_checkpoints']:
-            ckpt=tf.train.Checkpoint(enc=self.encoder,dec=self.decoder,opt=self.opt)
-            self.ckpt_mgr=tf.train.CheckpointManager(ckpt,self.cfg['checkpoint_dir'],max_to_keep=3)
+            ckpt = tf.train.Checkpoint(enc=self.encoder, dec=self.decoder, opt=self.opt)
+            self.ckpt_mgr = tf.train.CheckpointManager(ckpt, self.cfg['checkpoint_dir'], max_to_keep=3)
             if self.ckpt_mgr.latest_checkpoint:
-                ckpt.restore(self.ckpt_mgr.latest_checkpoint); print("Restored",self.ckpt_mgr.latest_checkpoint)
+                ckpt.restore(self.ckpt_mgr.latest_checkpoint)
+                print("Restored", self.ckpt_mgr.latest_checkpoint)
 
     # ─────────────────────────────
     # 5.2 helpers
@@ -275,42 +368,42 @@ class CaptioningSystem:
     # ─────────────────────────────
     # 5.3 train-step @tf.function
     # ─────────────────────────────
-    @tf.function
-    def _train_step(self,img,tgt,ln,ss_p):
-        B=tf.shape(img)[0]
+    def _train_step(self, img, tgt, ln, ss_p):
+        B = tf.shape(img)[0]
+
         with tf.GradientTape() as tape:
-            feat=self.encoder(img)                                    # (B,64,2048)
-            h=tf.zeros((B,self.cfg['units']),feat.dtype); c=tf.zeros_like(h)
-            dec_in=tf.expand_dims(tf.fill([B],self.proc.tokeniser.word_index['<start>']),1)
-            attn_cov=tf.zeros((B,tf.shape(feat)[1]),feat.dtype)
-            total_ce=tf.constant(0.,tf.float32)
+            feat = tf.cast(self.encoder(img), tf.float32)              # force fp32
+            h    = tf.zeros((B, self.cfg['units']), tf.float32)
+            c    = tf.zeros_like(h)
 
-            for t in tf.range(1,self.cfg['max_length']):
-                logits,h,c,alpha=self.decoder(dec_in,feat,h,c)
-                attn_cov+=alpha
-                ce=self.loss_fn(tgt[:,t],tf.squeeze(logits,1))
-                mask=tf.cast(tgt[:,t]!=0,tf.float32); total_ce+=tf.reduce_sum(ce*mask)
+            start_id = self.proc.tokeniser.word_index['<start>']
+            dec_in   = tf.expand_dims(tf.fill([B], start_id), 1)
 
-                pred=tf.argmax(logits,-1,output_type=tf.int32)[:,0]
-                use_pred=tf.less(tf.random.uniform([B]),ss_p)
-                nxt=tf.where(use_pred,pred,tgt[:,t])
-                dec_in=tf.expand_dims(nxt,1)
+            L = tf.shape(feat)[1]
+            attn_cov = tf.zeros((B, L), tf.float32)
+            total_ce = tf.constant(0.0, tf.float32)
 
-            ce_loss=total_ce/tf.reduce_sum(tf.cast(ln,tf.float32))
-            reg=tf.reduce_mean(tf.square(1.-self._cast(attn_cov)))
-            loss=ce_loss+self.cfg['attention_reg_lambda']*reg        # coverage [spec 5]
+            for t in range(1, self.cfg['max_length']):
+                logits, h, c, alpha = self.decoder(dec_in, feat, h, c)
+                attn_cov += alpha
+                ce = self.loss_fn(tgt[:, t], logits[:, 0, :])
+                mask = tf.cast(tgt[:, t] != 0, tf.float32)
+                total_ce += tf.reduce_sum(ce * mask)
 
-            if isinstance(self.opt,tf.keras.mixed_precision.LossScaleOptimizer):
-                loss_scaled=self.opt.get_scaled_loss(loss)
-            else: loss_scaled=loss
+                pred = tf.argmax(logits, -1, output_type=tf.int32)[:, 0]
+                use_pred = tf.random.uniform([B]) < ss_p
+                nxt = tf.where(use_pred, pred, tgt[:, t])
+                dec_in = tf.expand_dims(nxt, 1)
 
-        vars=self.encoder.trainable_variables+self.decoder.trainable_variables
-        grads=tape.gradient(loss_scaled,vars)
-        if isinstance(self.opt,tf.keras.mixed_precision.LossScaleOptimizer):
-            grads=self.opt.get_unscaled_gradients(grads)
-        grads,_=tf.clip_by_global_norm(grads,self.cfg['grad_clip_value'])
-        self.opt.apply_gradients(zip(grads,vars))
-        return loss,tf.linalg.global_norm(grads)
+            ce_loss = total_ce / tf.reduce_sum(tf.cast(ln, tf.float32))
+            reg = tf.reduce_mean(tf.square(1.0 - attn_cov))
+            loss = ce_loss + self.cfg['attention_reg_lambda'] * reg
+
+        vars_ = self.encoder.trainable_variables + self.decoder.trainable_variables
+        grads = tape.gradient(loss, vars_)
+        grads, _ = tf.clip_by_global_norm(grads, self.cfg['grad_clip_value'])
+        self.opt.apply_gradients(zip(grads, vars_))
+        return loss, tf.linalg.global_norm(grads)
 
     # ─────────────────────────────
     # 5.4 greedy decode – **batched** & @tf.function  [spec 8]
@@ -373,31 +466,45 @@ class CaptioningSystem:
     # ─────────────────────────────
     # 5.6 beam search w/ trigram block [spec 11] + dedup [12]
     # ─────────────────────────────
-    def beam_search(self,img_path,beam=5,len_pen=0.7):
-        feat=self.encoder(tf.expand_dims(
-            self.proc._augment(self.proc._load_img(tf.constant(img_path)),train=False),0))
-        start,end=self.proc.tokeniser.word_index['<start>'],self.proc.tokeniser.word_index['<end>']
-        beams=[(0,[start],tf.zeros((1,self.cfg['units'])),tf.zeros((1,self.cfg['units'])),[])]
-        completed=[]
+    def beam_search(self, image_path, beam=5, len_pen=0.7, return_attention=False):
+        img = self.proc._augment(self.proc._load_img(tf.constant(image_path)), train=False)
+        feat = self.encoder(tf.expand_dims(img, 0))                      # (1,64,2048)
+        dty  = feat.dtype
+        start = self.proc.tokeniser.word_index['<start>']
+        end   = self.proc.tokeniser.word_index['<end>']
+
+        beams = [(0.0, [start],
+                  tf.zeros((1, self.cfg['units']), dty),
+                  tf.zeros((1, self.cfg['units']), dty),
+                  [])]                                                   # score, seq, h, c, α-list
+        completed = []
+
         for _ in range(self.cfg['max_length']):
-            cand=[]
-            for score,seq,h,c,alphas in beams:
-                if seq[-1]==end: completed.append((score,seq,alphas)); continue
-                logits,h1,c1,alpha=self.decoder(tf.expand_dims([seq[-1]],0),feat,h,c)
-                log_p=tf.nn.log_softmax(self._cast(logits[0,0]))
-                top=tf.math.top_k(log_p,beam).indices.numpy()
-                for tok in top:
-                    tok=int(tok); 
-                    if self._repeat_trigram(seq,tok): continue
-                    cand.append((score+float(log_p[tok]),seq+[tok],h1,c1,alphas+[alpha[0].numpy()]))
+            cand = []
+            for score, seq, h, c, alphas in beams:
+                if seq[-1] == end:
+                    completed.append((score, seq, alphas)); continue
+                logits, h1, c1, alpha = self.decoder(tf.expand_dims([seq[-1]], 0),
+                                                     feat, h, c)
+                logp = tf.nn.log_softmax(self._cast(logits[0, 0]))
+                topk = tf.math.top_k(logp, beam).indices.numpy()
+                for tok in topk:
+                    if self._repeat_trigram(seq, tok): continue
+                    cand.append((score + float(logp[tok]),
+                                 seq + [tok], h1, c1, alphas + [alpha[0].numpy()]))
+
             if not cand: break
-            cand.sort(key=lambda x:x[0]/((len(x[1])**len_pen)),reverse=True)
-            beams=cand[:beam]
-            if len(completed)>=beam: break
-        best=max(completed+beams,key=lambda x:x[0]/((len(x[1]))**len_pen))
-        words=[self.proc.tokeniser.index_word.get(i,'') for i in best[1]
-               if i not in (start,end,0)] 
-        return " ".join(self._dedup(words))
+            cand.sort(key=lambda x: x[0] / (len(x[1]) ** len_pen), reverse=True)
+            beams = cand[:beam]
+            if len(completed) >= beam: break
+
+        best = max(completed + beams,
+                   key=lambda x: x[0] / (len(x[1]) ** len_pen))
+        words = [self.proc.tokeniser.index_word.get(i, '')
+                 for i in best[1]
+                 if i not in (start, end, 0)]
+        caption = " ".join(self._dedup(words))
+        return (caption, best[2]) if return_attention else caption
 
     # ─────────────────────────────
     # 5.7 main TRAIN LOOP (spec 4,6,7,10,14)
@@ -434,24 +541,119 @@ class CaptioningSystem:
                 self.encoder.unfreeze_top_layers(8); 
                 self.opt=tf.keras.optimizers.Adam(1e-5)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 6. SET-UP & RUN
-# ──────────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    #  DEMO - show image, GT captions, model caption, attention overlays
+    # -------------------------------------------------------------------------
+    def demo(self, image_path, beam=5, len_pen=0.7):
+        import matplotlib.pyplot as plt
+        from PIL import Image
+
+        if not os.path.exists(image_path):
+            print("Image not found:", image_path); return
+
+        # 1) image preview
+        img_name = os.path.basename(image_path)
+        plt.figure(figsize=(6, 5))
+        plt.imshow(Image.open(image_path)); plt.title(img_name); plt.axis('off')
+        plt.show()
+
+        # 2) ground-truth captions
+        gts = self.proc.caption_map.get(img_name, [])
+        print("Ground-truth captions:")
+        for c in gts[:5]: print(" •", c)
+
+        # 3) prediction + attention
+        caption, alphas = self.beam_search(image_path, beam, len_pen, return_attention=True)
+        print("\nPredicted:", caption)
+
+        # attention heat-maps
+        words = caption.split()
+        if not alphas: return
+        L = int(np.sqrt(alphas[0].shape[0]))           # 8×8 grid
+        img = np.array(Image.open(image_path).resize((299, 299)))
+
+        cols = 3
+        rows = int(np.ceil(len(words) / cols))
+        plt.figure(figsize=(4 * cols, 3 * rows))
+        for i, (w, a) in enumerate(zip(words, alphas)):
+            plt.subplot(rows, cols, i + 1)
+            plt.imshow(img); plt.axis('off'); plt.title(w)
+            a = a.reshape(L, L); a = (a - a.min()) / (a.ptp() + 1e-6)
+            a_up = Image.fromarray((a * 255).astype(np.uint8)).resize((299, 299))
+            plt.imshow(np.array(a_up) / 255., cmap='jet', alpha=0.5, extent=(0, 299, 299, 0))
+        plt.tight_layout(); plt.show()
+
+    # -------------------------------------------------------------------------
+    #  TRAINING CURVES - loss & BLEU-4
+    # -------------------------------------------------------------------------
+    def plot_history(self):
+        import matplotlib.pyplot as plt
+        epochs = range(1, len(self.loss_log) + 1)
+
+        plt.figure(figsize=(12, 4))
+
+        plt.subplot(1, 2, 1)
+        plt.plot(epochs, self.loss_log, label='Train CE-loss')
+        plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.grid(True); plt.legend()
+
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs, self.tr_bleu, label='Micro-val BLEU-4')
+        if any(np.isfinite(self.val_bleu)):
+            plt.plot(epochs, np.nan_to_num(self.val_bleu, nan=np.nan),
+                     label='Full-val BLEU-4', linestyle='--')
+        plt.xlabel('Epoch'); plt.ylabel('BLEU-4'); plt.grid(True); plt.legend()
+
+        plt.tight_layout(); plt.show()
+
+
+# In[ ]:
+
+
 processor=DataProcessor(CONFIG); processor.prepare()
+
+
+# In[ ]:
+
 
 train_ds=processor.make_ds(processor.train_pairs,train=True)
 val_ds =processor.make_ds(processor.val_pairs ,train=False)
 
+
+# In[ ]:
+
+
 # fixed 500-img micro-val subset
 micro_val=random.sample(processor.val_pairs,min(500,len(processor.val_pairs)))
+
+
+# In[ ]:
+
+
 # full val cached feats
 val_feats=processor.val_pairs                               # caching handled inside class
 
-system=CaptioningSystem(CONFIG,processor)
+
+# In[ ]:
+
+
+system=CaptioningSystem(CONFIG, processor)
+
+
+# In[ ]:
+
+
 system.train(train_ds,micro_val,processor.val_pairs)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. DEMO
-# ──────────────────────────────────────────────────────────────────────────────
-demo_img=os.path.join(CONFIG['image_dir'],processor.test_pairs[0][0])
-print("Beam-search caption:",system.beam_search(demo_img))
+
+# In[ ]:
+
+
+system.plot_history()
+
+
+# In[ ]:
+
+
+test_img = os.path.join(CONFIG['image_dir'], processor.test_pairs[0][0])
+system.demo(test_img, beam=5, len_pen=0.7)
+
