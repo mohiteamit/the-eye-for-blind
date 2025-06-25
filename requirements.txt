@@ -6,3 +6,4 @@
 # nltk                             # BLEU-1‒4 metrics (nltk.translate.bleu_score)
 gTTS                             # Google-TTS for caption-to-speech demo
 gdown
+seaborn
